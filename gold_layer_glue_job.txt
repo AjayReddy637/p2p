@@ -1,0 +1,1033 @@
+import sys
+import json
+import logging
+import boto3
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, lit, current_timestamp, current_date, when, sum as spark_sum,
+    count, avg, min as spark_min, max as spark_max, datediff, round as spark_round,
+    year, month, row_number, coalesce, abs as spark_abs, stddev, expr
+)
+from pyspark.sql.window import Window
+from pyspark.sql.types import DecimalType, StringType, DateType, IntegerType, DoubleType
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+# --------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+bucket = "yignite-procurespendiq-miniature"
+silver_hub_path = f"s3://{bucket}/silver/raw_vault/hub"
+silver_link_path = f"s3://{bucket}/silver/raw_vault/links"
+silver_sat_path = f"s3://{bucket}/silver/raw_vault/satellites"
+gold_path = f"s3://{bucket}/gold/information_mart"
+# --------------------------------------------------------------
+# Spark Session
+# --------------------------------------------------------------
+spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+glueContext = GlueContext(spark.sparkContext)
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+# --------------------------------------------------------------
+# Helper Functions
+# --------------------------------------------------------------
+def read_silver_table(table_type, table_name):
+    """Read a table from silver layer"""
+    if table_type == "hub":
+        path = f"{silver_hub_path}/{table_name}"
+    elif table_type == "link":
+        path = f"{silver_link_path}/{table_name}"
+    elif table_type == "sat":
+        path = f"{silver_sat_path}/{table_name}"
+    else:
+        raise ValueError(f"Unknown table type: {table_type}")
+    
+    try:
+        df = spark.read.parquet(path)
+        logger.info("Read %s table %s with %d rows", table_type, table_name, df.count())
+        return df
+    except Exception as e:
+        logger.warning("Could not read %s table %s: %s", table_type, table_name, e)
+        return None
+def write_gold_table(df, table_name, mode="overwrite"):
+    """Write DataFrame to gold layer"""
+    path = f"{gold_path}/{table_name}"
+    df.write.mode(mode).parquet(path)
+    logger.info("Written %d rows to %s", df.count(), path)
+def safe_col(df, col_name, default=None):
+    """Safely reference a column with a default value if it doesn't exist"""
+    if col_name.lower() in [c.lower() for c in df.columns]:
+        return col(col_name)
+    return lit(default)
+# --------------------------------------------------------------
+# Dimension Tables
+# --------------------------------------------------------------
+def create_dim_company_code():
+    """Create dim_company_code table"""
+    logger.info("Creating dim_company_code")
+    
+    hub_company = read_silver_table("hub", "HUB_COMPANY_CODE")
+    sat_company = read_silver_table("sat", "SAT_COMPANY_T001")
+    
+    if hub_company is None or sat_company is None:
+        logger.warning("Cannot create dim_company_code - missing source tables")
+        return
+    
+    # Join hub with satellite
+    df = hub_company.alias("hub").join(
+        sat_company.alias("sat"),
+        col("hub.hub_hash_key") == col("sat.hub_hash_key"),
+        "inner"
+    )
+    
+    # Select and transform columns
+    result = df.select(
+        col("hub.business_key").cast(DecimalType(4, 0)).alias("company_code"),
+        coalesce(col("sat.butxt"), lit("")).alias("company_name"),
+        coalesce(col("sat.ort01"), lit("")).alias("city"),
+        coalesce(col("sat.land1"), lit("")).alias("country_code"),
+        coalesce(col("sat.waers"), lit("")).alias("currency"),
+        coalesce(col("sat.pstlz"), lit("")).alias("postal_code"),
+        coalesce(col("sat.stras"), lit("")).alias("street"),
+        coalesce(col("sat.reession"), lit("")).alias("region_code"),
+        coalesce(col("sat.stceg"), lit("")).alias("vat_reg_number"),
+        coalesce(col("sat.ktopl"), lit("")).alias("chart_of_accounts"),
+        lit("SAP").alias("system")
+    ).distinct()
+    
+    write_gold_table(result, "dim_company_code")
+def create_dim_vendor():
+    """Create dim_vendor table"""
+    logger.info("Creating dim_vendor")
+    
+    hub_vendor = read_silver_table("hub", "HUB_VENDOR")
+    sat_vendor = read_silver_table("sat", "SAT_VENDOR_LFA1")
+    
+    if hub_vendor is None or sat_vendor is None:
+        logger.warning("Cannot create dim_vendor - missing source tables")
+        return
+    
+    df = hub_vendor.alias("hub").join(
+        sat_vendor.alias("sat"),
+        col("hub.hub_hash_key") == col("sat.hub_hash_key"),
+        "inner"
+    )
+    
+    result = df.select(
+        col("hub.business_key").alias("vendor_id"),
+        coalesce(col("sat.name1"), lit("")).alias("vendor_name"),
+        coalesce(col("sat.name2"), lit("")).alias("vendor_name_2"),
+        coalesce(col("sat.land1"), lit("")).alias("country_code"),
+        coalesce(col("sat.ort01"), lit("")).alias("city"),
+        coalesce(col("sat.pstlz"), lit("")).alias("postal_code"),
+        coalesce(col("sat.stras"), lit("")).alias("street"),
+        coalesce(col("sat.reession"), lit("")).alias("region_code"),
+        coalesce(col("sat.stcd1"), lit("")).alias("tax_number_1"),
+        coalesce(col("sat.stcd2"), lit("")).alias("tax_number_2"),
+        coalesce(col("sat.brsch"), lit("")).alias("industry_sector"),
+        coalesce(col("sat.ktokk"), lit("")).alias("vendor_account_group"),
+        coalesce(col("sat.loevm"), lit("")).alias("deletion_flag"),
+        coalesce(col("sat.sperr"), lit("")).alias("posting_block"),
+        lit("SAP").alias("system")
+    ).distinct()
+    
+    write_gold_table(result, "dim_vendor")
+def create_dim_plant():
+    """Create dim_plant table"""
+    logger.info("Creating dim_plant")
+    
+    hub_plant = read_silver_table("hub", "HUB_PLANT")
+    sat_plant = read_silver_table("sat", "SAT_PLANT_T001W")
+    
+    if hub_plant is None or sat_plant is None:
+        logger.warning("Cannot create dim_plant - missing source tables")
+        return
+    
+    df = hub_plant.alias("hub").join(
+        sat_plant.alias("sat"),
+        col("hub.hub_hash_key") == col("sat.hub_hash_key"),
+        "inner"
+    )
+    
+    result = df.select(
+        col("hub.business_key").alias("plant_code"),
+        coalesce(col("sat.name1"), lit("")).alias("plant_name"),
+        coalesce(col("sat.name2"), lit("")).alias("plant_name_2"),
+        coalesce(col("sat.bukrs"), lit(0)).cast(DecimalType(4, 0)).alias("company_code"),
+        coalesce(col("sat.land1"), lit("")).alias("country_code"),
+        coalesce(col("sat.reession"), lit("")).alias("region_code"),
+        coalesce(col("sat.ort01"), lit("")).alias("city"),
+        coalesce(col("sat.pstlz"), lit("")).alias("postal_code"),
+        coalesce(col("sat.stras"), lit("")).alias("street"),
+        lit("SAP").alias("system")
+    ).distinct()
+    
+    write_gold_table(result, "dim_plant")
+def create_dim_region():
+    """Create dim_region table"""
+    logger.info("Creating dim_region")
+    
+    sat_region = read_silver_table("sat", "SAT_REGION_T005U")
+    
+    if sat_region is None:
+        logger.warning("Cannot create dim_region - missing source table")
+        return
+    
+    result = sat_region.select(
+        coalesce(col("land1"), lit("")).alias("country_code"),
+        coalesce(col("bland"), lit("")).alias("region_code"),
+        coalesce(col("bezei"), lit("")).alias("region_name")
+    ).distinct()
+    
+    write_gold_table(result, "dim_region")
+def create_dim_po():
+    """Create dim_po table"""
+    logger.info("Creating dim_po")
+    
+    hub_po = read_silver_table("hub", "HUB_PURCHASE_ORDER")
+    hub_po_line = read_silver_table("hub", "HUB_PO_LINE")
+    sat_po_header = read_silver_table("sat", "SAT_PO_HEADER_EKKO")
+    sat_po_line = read_silver_table("sat", "SAT_PO_LINE_EKPO")
+    sat_po_schedule = read_silver_table("sat", "SAT_PO_SCHEDULE_EKET")
+    
+    if hub_po_line is None or sat_po_line is None:
+        logger.warning("Cannot create dim_po - missing source tables")
+        return
+    
+    # Join PO line with its satellite
+    df = hub_po_line.alias("hub").join(
+        sat_po_line.alias("sat"),
+        col("hub.hub_hash_key") == col("sat.hub_hash_key"),
+        "inner"
+    )
+    
+    # Join with schedule if available
+    if sat_po_schedule is not None:
+        df = df.join(
+            sat_po_schedule.alias("sched"),
+            col("hub.hub_hash_key") == col("sched.hub_hash_key"),
+            "left"
+        )
+        delivery_date = coalesce(col("sched.eindt"), lit(None).cast(DateType()))
+        quantity_delivered = coalesce(col("sched.wemng"), lit(0)).cast(DecimalType(5, 2))
+    else:
+        delivery_date = lit(None).cast(DateType())
+        quantity_delivered = lit(0).cast(DecimalType(5, 2))
+    
+    result = df.select(
+        coalesce(col("sat.ebeln"), lit(0)).cast(DecimalType(7, 0)).alias("purchase_order_number"),
+        coalesce(col("sat.ebelp"), lit(0)).cast(DecimalType(2, 0)).alias("po_item"),
+        coalesce(col("sat.netwr"), lit(0)).cast(DecimalType(8, 2)).alias("po_amount"),
+        coalesce(col("sat.lifnr"), lit("")).alias("vendor_id"),
+        coalesce(col("sat.bukrs"), lit(0)).cast(DecimalType(4, 0)).alias("company_code"),
+        col("sat.bedat").cast(DateType()).alias("po_date"),
+        col("sat.aedat").cast(DateType()).alias("po_created_date"),
+        coalesce(col("sat.bsart"), lit("")).alias("po_doc_type"),
+        coalesce(col("sat.zterm"), lit("")).alias("po_payment_terms"),
+        coalesce(col("sat.ekorg"), lit("")).alias("purchasing_org"),
+        coalesce(col("sat.ekgrp"), lit("")).alias("purchasing_group"),
+        coalesce(col("sat.waers"), lit("")).alias("po_currency"),
+        coalesce(col("sat.frgzu"), lit("")).alias("po_release_status"),
+        delivery_date.alias("delivery_date"),
+        quantity_delivered.alias("quantity_delivered"),
+        (coalesce(col("sat.menge"), lit(0)) - quantity_delivered).cast(DecimalType(1, 0)).alias("quantity_remaining"),
+        col("sat.agdat").cast(DateType()).alias("po_due_date")
+    ).distinct()
+    
+    write_gold_table(result, "dim_po")
+# --------------------------------------------------------------
+# Fact Tables
+# --------------------------------------------------------------
+def create_invoice_status_history():
+    """Create invoice_status_history table"""
+    logger.info("Creating invoice_status_history")
+    
+    hub_invoice = read_silver_table("hub", "HUB_INVOICE")
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    sat_status = read_silver_table("sat", "SAT_INVOICE_STATUS_LOG")
+    hub_invoice_line = read_silver_table("hub", "HUB_INVOICE_LINE")
+    sat_invoice_line = read_silver_table("sat", "SAT_INVOICE_LINE_RSEG")
+    sat_payment_terms = read_silver_table("sat", "SAT_PAYMENT_TERMS_T052")
+    
+    if hub_invoice is None or sat_invoice is None:
+        logger.warning("Cannot create invoice_status_history - missing source tables")
+        return
+    
+    # Start with invoice hub and satellite
+    df = hub_invoice.alias("hub").join(
+        sat_invoice.alias("sat"),
+        col("hub.hub_hash_key") == col("sat.hub_hash_key"),
+        "inner"
+    )
+    
+    # Join with status log if available
+    if sat_status is not None:
+        df = df.join(
+            sat_status.alias("status"),
+            col("hub.hub_hash_key") == col("status.hub_hash_key"),
+            "left"
+        )
+        status_col = coalesce(col("status.status"), lit("OPEN"))
+        effective_date = col("status.effective_date")
+        sequence_nbr = coalesce(col("status.sequence_nbr"), lit(1))
+        status_notes = coalesce(col("status.status_notes"), lit(""))
+    else:
+        status_col = lit("OPEN")
+        effective_date = col("sat.budat")
+        sequence_nbr = lit(1).cast(DecimalType(1, 0))
+        status_notes = lit("")
+    
+    # Calculate derived fields
+    result = df.select(
+        coalesce(col("sat.belnr"), lit(0)).cast(DecimalType(7, 0)).alias("invoice_number"),
+        coalesce(col("sat.bukrs"), lit(0)).cast(DecimalType(4, 0)).alias("company_code"),
+        coalesce(col("sat.bupla"), lit("")).alias("plant_code"),
+        coalesce(col("sat.gjahr"), lit(0)).cast(DecimalType(4, 0)).alias("fiscal_year"),
+        status_col.alias("status"),
+        effective_date.cast(DateType()).alias("effective_date"),
+        sequence_nbr.cast(DecimalType(1, 0)).alias("sequence_nbr"),
+        status_notes.alias("status_notes"),
+        col("sat.budat").cast(DateType()).alias("posting_date"),
+        col("sat.bldat").cast(DateType()).alias("document_date"),
+        coalesce(col("sat.lifnr"), lit("")).alias("vendor_id"),
+        coalesce(col("sat.waers"), lit("")).alias("currency"),
+        coalesce(col("sat.rmwwr"), lit(0)).cast(DecimalType(7, 2)).alias("invoice_amount_local"),
+        coalesce(col("sat.zterm"), lit("")).alias("payment_terms"),
+        coalesce(col("sat.blart"), lit("")).alias("document_type"),
+        coalesce(col("sat.xrech"), lit("")).alias("accrual_indicator"),
+        col("sat.zfbdt").cast(DateType()).alias("due_date"),
+        col("sat.cpudt").cast(DateType()).alias("invoice_receipt_date"),
+        lit(None).cast(DecimalType(6, 0)).alias("gl_account"),
+        col("sat.zfbdt").cast(DateType()).alias("baseline_date"),
+        lit(None).cast(DateType()).alias("payment_date"),
+        lit(None).cast(DecimalType(7, 0)).alias("clearing_document"),
+        datediff(current_date(), col("sat.budat")).cast(DecimalType(3, 0)).alias("aging_days"),
+        lit(None).cast(DecimalType(7, 0)).alias("purchase_order_reference"),
+        lit(None).cast(DecimalType(8, 2)).alias("po_amount"),
+        lit(None).alias("po_purpose"),
+        lit(0).cast(DecimalType(4, 3)).alias("discount_percent"),
+        lit(0).cast(DecimalType(2, 0)).alias("discount_days"),
+        lit(30).cast(DecimalType(2, 0)).alias("net_due_days"),
+        lit("").alias("region"),
+        lit("SAP").alias("system")
+    )
+    
+    write_gold_table(result, "invoice_status_history")
+def create_fact_sap_po_level():
+    """Create fact_sap_po_level table"""
+    logger.info("Creating fact_sap_po_level")
+    
+    sat_po_line = read_silver_table("sat", "SAT_PO_LINE_EKPO")
+    sat_po_schedule = read_silver_table("sat", "SAT_PO_SCHEDULE_EKET")
+    sat_mat_doc = read_silver_table("sat", "SAT_MAT_DOC_LINE_MSEG")
+    
+    if sat_po_line is None:
+        logger.warning("Cannot create fact_sap_po_level - missing source tables")
+        return
+    
+    # Join PO lines with schedule and material documents
+    df = sat_po_line.alias("po")
+    
+    if sat_po_schedule is not None:
+        df = df.join(
+            sat_po_schedule.alias("sched"),
+            (col("po.ebeln") == col("sched.ebeln")) & (col("po.ebelp") == col("sched.ebelp")),
+            "left"
+        )
+        delivery_date = col("sched.eindt")
+        received_qty = coalesce(col("sched.wemng"), lit(0))
+    else:
+        delivery_date = lit(None).cast(DateType())
+        received_qty = lit(0)
+    
+    result = df.select(
+        year(coalesce(col("po.budat"), current_date())).cast(DecimalType(4, 0)).alias("posting_year"),
+        month(coalesce(col("po.budat"), current_date())).cast(DecimalType(2, 0)).alias("posting_month"),
+        delivery_date.cast(DateType()).alias("delivery_date"),
+        col("po.bedat").cast(DateType()).alias("po_date"),
+        received_qty.cast(DecimalType(6, 3)).alias("received_qty"),
+        coalesce(col("po.menge"), lit(0)).cast(DecimalType(5, 2)).alias("ordered_qty"),
+        coalesce(col("po.netwr"), lit(0)).cast(DecimalType(8, 2)).alias("po_amount")
+    )
+    
+    write_gold_table(result, "fact_sap_po_level")
+# --------------------------------------------------------------
+# Metric/KPI Tables
+# --------------------------------------------------------------
+def create_accounts_payable_balance():
+    """Create accounts_payable_balance table"""
+    logger.info("Creating accounts_payable_balance")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create accounts_payable_balance - missing source tables")
+        return
+    
+    # Calculate AP balance by year/month
+    df = sat_invoice.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat")))
+    
+    result = df.groupBy("year", "month").agg(
+        spark_sum(coalesce(col("rmwwr"), lit(0))).cast(DecimalType(9, 2)).alias("ap_balance"),
+        count("*").cast(DecimalType(3, 0)).alias("invoice_count")
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("ap_balance"),
+        col("invoice_count")
+    )
+    
+    write_gold_table(result, "accounts_payable_balance")
+def create_cash_flow_forecast():
+    """Create cash_flow_forecast table"""
+    logger.info("Creating cash_flow_forecast")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create cash_flow_forecast - missing source tables")
+        return
+    
+    # Calculate days until due and bucket
+    df = sat_invoice.withColumn(
+        "days_until_due",
+        datediff(col("zfbdt"), current_date())
+    ).withColumn(
+        "forecast_bucket",
+        when(col("days_until_due") < 0, "Overdue")
+        .when(col("days_until_due") <= 7, "Due in 7 days")
+        .when(col("days_until_due") <= 30, "Due in 30 days")
+        .when(col("days_until_due") <= 60, "Due in 60 days")
+        .when(col("days_until_due") <= 90, "Due in 90 days")
+        .otherwise("Due beyond 90 days")
+    )
+    
+    result = df.groupBy("forecast_bucket").agg(
+        count("*").cast(DecimalType(10, 6)).alias("invoice_count"),
+        spark_sum(coalesce(col("rmwwr"), lit(0))).cast(DecimalType(10, 2)).alias("total_amount"),
+        spark_min(col("zfbdt")).cast(DateType()).alias("earliest_due"),
+        spark_max(col("zfbdt")).cast(DateType()).alias("latest_due")
+    )
+    
+    write_gold_table(result, "cash_flow_forecast")
+def create_cash_flow_unpaid_obligations():
+    """Create cash_flow_unpaid_obligations table"""
+    logger.info("Creating cash_flow_unpaid_obligations")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    sat_status = read_silver_table("sat", "SAT_INVOICE_STATUS_LOG")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create cash_flow_unpaid_obligations - missing source tables")
+        return
+    
+    df = sat_invoice.withColumn(
+        "days_until_due",
+        datediff(col("zfbdt"), current_date())
+    ).withColumn(
+        "invoice_status",
+        when(datediff(col("zfbdt"), current_date()) < 0, "OVERDUE")
+        .otherwise("OPEN")
+    )
+    
+    result = df.select(
+        coalesce(col("belnr"), lit(0)).cast(DecimalType(7, 0)).alias("document_number"),
+        coalesce(col("lifnr"), lit("")).alias("vendor_id"),
+        coalesce(col("rmwwr"), lit(0)).cast(DecimalType(7, 2)).alias("invoice_amount_local"),
+        col("zfbdt").cast(DateType()).alias("due_date"),
+        col("invoice_status"),
+        col("days_until_due").cast(DecimalType(3, 0))
+    )
+    
+    write_gold_table(result, "cash_flow_unpaid_obligations")
+def create_days_payable_outstanding():
+    """Create days_payable_outstanding table"""
+    logger.info("Creating days_payable_outstanding")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create days_payable_outstanding - missing source tables")
+        return
+    
+    df = sat_invoice.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat")))
+    
+    # Calculate DPO metrics per invoice
+    result = df.select(
+        coalesce(col("belnr"), lit(0)).cast(DecimalType(7, 0)).alias("invoice_number"),
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        coalesce(col("rmwwr"), lit(0)).cast(DecimalType(7, 2)).alias("avg_trade_payables"),
+        lit(0).cast(DecimalType(15, 10)).alias("cogs_amount"),  # Placeholder - needs business logic
+        lit(0).cast(DecimalType(10, 8)).alias("dpo")  # Placeholder - needs COGS data
+    )
+    
+    write_gold_table(result, "days_payable_outstanding")
+def create_on_time_payment_rate():
+    """Create on_time_payment_rate table"""
+    logger.info("Creating on_time_payment_rate")
+    
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_cleared is None:
+        logger.warning("Cannot create on_time_payment_rate - missing source tables")
+        return
+    
+    df = sat_cleared.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat"))) \
+                    .withColumn(
+                        "is_on_time",
+                        when(col("augdt") <= col("zfbdt"), 1).otherwise(0)
+                    )
+    
+    result = df.groupBy("year", "month").agg(
+        spark_sum(col("is_on_time")).cast(DecimalType(2, 0)).alias("on_time_payments"),
+        count("*").cast(DecimalType(3, 0)).alias("total_payments")
+    ).withColumn(
+        "on_time_payment_rate_pct",
+        (col("on_time_payments") / col("total_payments")).cast(DecimalType(8, 6))
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("on_time_payments"),
+        col("total_payments"),
+        col("on_time_payment_rate_pct")
+    )
+    
+    write_gold_table(result, "on_time_payment_rate")
+def create_late_payment_amount():
+    """Create late_payment_amount table"""
+    logger.info("Creating late_payment_amount")
+    
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_cleared is None:
+        logger.warning("Cannot create late_payment_amount - missing source tables")
+        return
+    
+    df = sat_cleared.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat"))) \
+                    .withColumn(
+                        "is_late",
+                        when(col("augdt") > col("zfbdt"), 1).otherwise(0)
+                    ).withColumn(
+                        "late_amount",
+                        when(col("augdt") > col("zfbdt"), col("dmbtr")).otherwise(0)
+                    )
+    
+    result = df.groupBy("year", "month").agg(
+        spark_sum(col("late_amount")).cast(DecimalType(9, 2)).alias("late_payment_amount"),
+        spark_sum(col("is_late")).cast(DecimalType(3, 0)).alias("late_payment_count"),
+        spark_sum(col("dmbtr")).cast(DecimalType(9, 2)).alias("total_payment_amount")
+    ).withColumn(
+        "late_payment_rate_pct",
+        (col("late_payment_amount") / col("total_payment_amount")).cast(DecimalType(11, 8))
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("late_payment_amount"),
+        col("late_payment_count"),
+        col("total_payment_amount"),
+        col("late_payment_rate_pct")
+    )
+    
+    write_gold_table(result, "late_payment_amount")
+def create_early_payment_candidates():
+    """Create early_payment_candidates table"""
+    logger.info("Creating early_payment_candidates")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    sat_vendor = read_silver_table("sat", "SAT_VENDOR_LFA1")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create early_payment_candidates - missing source tables")
+        return
+    
+    df = sat_invoice.withColumn(
+        "days_until_due",
+        datediff(col("zfbdt"), current_date())
+    ).filter(col("days_until_due") > 0)  # Only open invoices with future due dates
+    
+    # Join with vendor for name
+    if sat_vendor is not None:
+        df = df.alias("inv").join(
+            sat_vendor.alias("v"),
+            col("inv.lifnr") == col("v.lifnr"),
+            "left"
+        )
+        vendor_name = coalesce(col("v.name1"), lit(""))
+    else:
+        vendor_name = lit("")
+    
+    result = df.select(
+        coalesce(col("inv.belnr"), lit(0)).cast(DecimalType(7, 0)).alias("document_number"),
+        coalesce(col("inv.lifnr"), lit("")).alias("vendor_id"),
+        vendor_name.alias("vendor_name"),
+        coalesce(col("inv.rmwwr"), lit(0)).cast(DecimalType(7, 2)).alias("invoice_amount_local"),
+        col("inv.zfbdt").cast(DateType()).alias("due_date"),
+        col("days_until_due").cast(DecimalType(2, 0)),
+        (coalesce(col("inv.rmwwr"), lit(0)) * 0.02).cast(DecimalType(7, 4)).alias("savings_if_2pct_discount"),
+        when(coalesce(col("inv.rmwwr"), lit(0)) > 10000, "Tier 1")
+        .when(coalesce(col("inv.rmwwr"), lit(0)) > 5000, "Tier 2")
+        .otherwise("Tier 3").alias("vendor_tier"),
+        when(col("days_until_due") <= 10, "High")
+        .when(col("days_until_due") <= 20, "Medium")
+        .otherwise("Low").alias("early_pay_priority")
+    )
+    
+    write_gold_table(result, "early_payment_candidates")
+def create_payment_processing_cycle_time():
+    """Create payment_processing_cycle_time table"""
+    logger.info("Creating payment_processing_cycle_time")
+    
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_cleared is None:
+        logger.warning("Cannot create payment_processing_cycle_time - missing source tables")
+        return
+    
+    df = sat_cleared.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat"))) \
+                    .withColumn(
+                        "cycle_time_days",
+                        datediff(col("augdt"), col("budat"))
+                    )
+    
+    result = df.groupBy("year", "month").agg(
+        avg(col("cycle_time_days")).cast(DecimalType(9, 6)).alias("avg_payment_cycle_time_days"),
+        spark_min(col("cycle_time_days")).cast(DecimalType(3, 0)).alias("min_cycle_time_days"),
+        spark_max(col("cycle_time_days")).cast(DecimalType(3, 0)).alias("max_cycle_time_days"),
+        count("*").cast(DecimalType(3, 0)).alias("cleared_invoices")
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("avg_payment_cycle_time_days"),
+        col("min_cycle_time_days"),
+        col("max_cycle_time_days"),
+        col("cleared_invoices")
+    )
+    
+    write_gold_table(result, "payment_processing_cycle_time")
+def create_supplier_delivery_accuracy_index():
+    """Create supplier_delivery_accuracy_index table"""
+    logger.info("Creating supplier_delivery_accuracy_index")
+    
+    sat_po_schedule = read_silver_table("sat", "SAT_PO_SCHEDULE_EKET")
+    sat_mat_doc = read_silver_table("sat", "SAT_MAT_DOC_LINE_MSEG")
+    
+    if sat_po_schedule is None:
+        logger.warning("Cannot create supplier_delivery_accuracy_index - missing source tables")
+        return
+    
+    df = sat_po_schedule.withColumn("year", year(col("eindt"))) \
+                        .withColumn("month", month(col("eindt"))) \
+                        .withColumn(
+                            "is_on_time",
+                            when(col("slfdt") <= col("eindt"), 1).otherwise(0)
+                        )
+    
+    result = df.groupBy("year", "month").agg(
+        spark_sum(col("is_on_time")).cast(DecimalType(3, 0)).alias("on_time_deliveries"),
+        count("*").cast(DecimalType(3, 0)).alias("total_deliveries")
+    ).withColumn(
+        "delivery_accuracy_pct",
+        (col("on_time_deliveries") / col("total_deliveries")).cast(DecimalType(8, 6))
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("on_time_deliveries"),
+        col("total_deliveries"),
+        col("delivery_accuracy_pct")
+    )
+    
+    write_gold_table(result, "supplier_delivery_accuracy_index")
+def create_gr_ir_aging():
+    """Create gr_ir_aging table"""
+    logger.info("Creating gr_ir_aging")
+    
+    sat_mat_doc = read_silver_table("sat", "SAT_MAT_DOC_LINE_MSEG")
+    sat_invoice_line = read_silver_table("sat", "SAT_INVOICE_LINE_RSEG")
+    
+    if sat_mat_doc is None:
+        logger.warning("Cannot create gr_ir_aging - missing source tables")
+        return
+    
+    df = sat_mat_doc.withColumn("year", year(coalesce(col("budat"), current_date()))) \
+                    .withColumn("month", month(coalesce(col("budat"), current_date()))) \
+                    .withColumn(
+                        "age_days",
+                        datediff(current_date(), coalesce(col("budat"), current_date()))
+                    )
+    
+    result = df.groupBy("year", "month").agg(
+        avg(col("age_days")).cast(DecimalType(2, 0)).alias("age_days"),
+        spark_sum(coalesce(col("dmbtr"), lit(0))).cast(DecimalType(9, 2)).alias("total_grir_balance"),
+        spark_sum(when(col("age_days") > 30, col("dmbtr")).otherwise(0)).cast(DecimalType(9, 2)).alias("grir_over_30"),
+        spark_sum(when(col("age_days") > 60, col("dmbtr")).otherwise(0)).cast(DecimalType(9, 2)).alias("grir_over_60"),
+        spark_sum(when(col("age_days") > 90, col("dmbtr")).otherwise(0)).cast(DecimalType(9, 2)).alias("grir_over_90"),
+        count(when(col("age_days") > 30, 1)).cast(DecimalType(3, 0)).alias("cnt_grir_over_30"),
+        count(when(col("age_days") > 60, 1)).cast(DecimalType(3, 0)).alias("cnt_grir_over_60"),
+        count(when(col("age_days") > 90, 1)).cast(DecimalType(3, 0)).alias("cnt_grir_over_90")
+    ).withColumn(
+        "pct_grir_over_30",
+        (col("grir_over_30") / col("total_grir_balance")).cast(DecimalType(8, 8))
+    ).withColumn(
+        "pct_grir_over_60",
+        (col("grir_over_60") / col("total_grir_balance")).cast(DecimalType(8, 8))
+    ).withColumn(
+        "pct_grir_over_90",
+        (col("grir_over_90") / col("total_grir_balance")).cast(DecimalType(8, 8))
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("age_days"),
+        col("total_grir_balance"),
+        col("grir_over_30"),
+        col("grir_over_60"),
+        col("grir_over_90"),
+        col("pct_grir_over_30"),
+        col("pct_grir_over_60"),
+        col("pct_grir_over_90"),
+        col("cnt_grir_over_30"),
+        col("cnt_grir_over_60"),
+        col("cnt_grir_over_90")
+    )
+    
+    write_gold_table(result, "gr_ir_aging")
+def create_gr_ir_outstanding_balance():
+    """Create gr_ir_outstanding_balance table"""
+    logger.info("Creating gr_ir_outstanding_balance")
+    
+    sat_mat_doc = read_silver_table("sat", "SAT_MAT_DOC_LINE_MSEG")
+    
+    if sat_mat_doc is None:
+        logger.warning("Cannot create gr_ir_outstanding_balance - missing source tables")
+        return
+    
+    df = sat_mat_doc.withColumn("year", year(coalesce(col("budat"), current_date()))) \
+                    .withColumn("month", month(coalesce(col("budat"), current_date())))
+    
+    result = df.groupBy("year", "month").agg(
+        count("*").cast(DecimalType(3, 0)).alias("invoice_count"),
+        spark_sum(coalesce(col("dmbtr"), lit(0))).cast(DecimalType(9, 2)).alias("total_grir_blnc")
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("invoice_count"),
+        col("total_grir_blnc")
+    )
+    
+    write_gold_table(result, "gr_ir_outstanding_balance")
+def create_full_payment_rate():
+    """Create full_payment_rate table"""
+    logger.info("Creating full_payment_rate")
+    
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_cleared is None:
+        logger.warning("Cannot create full_payment_rate - missing source tables")
+        return
+    
+    df = sat_cleared.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat")))
+    
+    # Assume full payment if amount matches (simplified logic)
+    result = df.groupBy("year", "month").agg(
+        count("*").cast(DecimalType(1, 0)).alias("full_paid_invoices"),  # Simplified
+        count("*").cast(DecimalType(3, 0)).alias("total_cleared_invoices")
+    ).withColumn(
+        "full_payment_rate_pct",
+        lit(1.0).cast(DecimalType(7, 6))  # Placeholder
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("full_paid_invoices"),
+        col("total_cleared_invoices"),
+        col("full_payment_rate_pct")
+    )
+    
+    write_gold_table(result, "full_payment_rate")
+def create_partial_payment_rate():
+    """Create partial_payment_rate table"""
+    logger.info("Creating partial_payment_rate")
+    
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_cleared is None:
+        logger.warning("Cannot create partial_payment_rate - missing source tables")
+        return
+    
+    df = sat_cleared.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat")))
+    
+    result = df.groupBy("year", "month").agg(
+        lit(0).cast(DecimalType(3, 0)).alias("partial_paid_invoices"),  # Placeholder
+        count("*").cast(DecimalType(3, 0)).alias("total_paid_invoices")
+    ).withColumn(
+        "partial_payment_rate_pct",
+        lit(0.0).cast(DecimalType(8, 6))  # Placeholder
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("partial_paid_invoices"),
+        col("total_paid_invoices"),
+        col("partial_payment_rate_pct")
+    )
+    
+    write_gold_table(result, "partial_payment_rate")
+def create_duplicate_payments_for_invoice():
+    """Create duplicate_payments_for_invoice table"""
+    logger.info("Creating duplicate_payments_for_invoice")
+    
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_cleared is None:
+        logger.warning("Cannot create duplicate_payments_for_invoice - missing source tables")
+        return
+    
+    # Group by invoice and count payments
+    df = sat_cleared.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat")))
+    
+    window = Window.partitionBy("belnr", "bukrs", "gjahr")
+    
+    df = df.withColumn("payment_count", count("*").over(window))
+    
+    # Filter to potential duplicates (more than 1 payment per invoice)
+    duplicates = df.filter(col("payment_count") > 1)
+    
+    result = duplicates.groupBy("belnr", "year", "month").agg(
+        spark_sum(col("dmbtr")).cast(DecimalType(7, 2)).alias("duplicate_payment_amount"),
+        spark_sum(col("dmbtr")).cast(DecimalType(7, 2)).alias("total_payments")
+    ).withColumn(
+        "duplicate_payment_rate",
+        (col("duplicate_payment_amount") / col("total_payments")).cast(DecimalType(11, 8))
+    ).select(
+        col("belnr").cast(DecimalType(7, 0)).alias("invoice_number"),
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("duplicate_payment_amount"),
+        col("total_payments"),
+        col("duplicate_payment_rate")
+    )
+    
+    write_gold_table(result, "duplicate_payments_for_invoice")
+def create_late_accruals():
+    """Create late_accruals table"""
+    logger.info("Creating late_accruals")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create late_accruals - missing source tables")
+        return
+    
+    df = sat_invoice.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat"))) \
+                    .withColumn(
+                        "is_late_accrual",
+                        when(datediff(col("budat"), col("bldat")) > 30, 1).otherwise(0)
+                    ).withColumn(
+                        "late_accrual_amount",
+                        when(col("is_late_accrual") == 1, col("rmwwr")).otherwise(0)
+                    )
+    
+    result = df.groupBy("year", "month").agg(
+        spark_sum(col("late_accrual_amount")).cast(DecimalType(9, 2)).alias("late_accrual_amount"),
+        spark_sum(col("is_late_accrual")).cast(DecimalType(3, 0)).alias("late_accrual_count"),
+        spark_sum(col("rmwwr")).cast(DecimalType(9, 2)).alias("total_accrual_amount")
+    ).withColumn(
+        "late_accrual_rate_pct",
+        (col("late_accrual_amount") / col("total_accrual_amount")).cast(DecimalType(10, 8))
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("late_accrual_amount"),
+        col("late_accrual_count"),
+        col("total_accrual_amount"),
+        col("late_accrual_rate_pct")
+    )
+    
+    write_gold_table(result, "late_accruals")
+def create_weighted_days_payable_outstanding():
+    """Create weighted_days_payable_outstanding table"""
+    logger.info("Creating weighted_days_payable_outstanding")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create weighted_days_payable_outstanding - missing source tables")
+        return
+    
+    df = sat_invoice.withColumn("year", year(col("budat"))) \
+                    .withColumn("month", month(col("budat")))
+    
+    result = df.groupBy("year", "month").agg(
+        spark_sum(col("rmwwr")).cast(DecimalType(9, 2)).alias("total_payables"),
+        lit(1).cast(DecimalType(10, 3)).alias("total_cogs")  # Placeholder - needs COGS data
+    ).withColumn(
+        "weighted_dpo",
+        ((col("total_payables") / col("total_cogs")) * 365).cast(DecimalType(10, 8))
+    ).select(
+        col("year").cast(DecimalType(4, 0)),
+        col("month").cast(DecimalType(2, 0)),
+        col("total_payables"),
+        col("total_cogs"),
+        col("weighted_dpo")
+    )
+    
+    write_gold_table(result, "weighted_days_payable_outstanding")
+def create_payment_predictability_index():
+    """Create payment_predictability_index table"""
+    logger.info("Creating payment_predictability_index")
+    
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_cleared is None:
+        logger.warning("Cannot create payment_predictability_index - missing source tables")
+        return
+    
+    df = sat_cleared.withColumn("posting_year", year(col("budat"))) \
+                    .withColumn("posting_month", month(col("budat"))) \
+                    .withColumn(
+                        "payment_variance",
+                        datediff(col("augdt"), col("zfbdt"))
+                    )
+    
+    # Calculate standard deviation of payment variance
+    result = df.groupBy("posting_year", "posting_month").agg(
+        stddev(col("payment_variance")).cast(DoubleType()).alias("payment_predictability_index")
+    ).withColumn(
+        "interpretation",
+        when(col("payment_predictability_index") < 5, "Highly Predictable")
+        .when(col("payment_predictability_index") < 10, "Moderately Predictable")
+        .when(col("payment_predictability_index") < 20, "Somewhat Unpredictable")
+        .otherwise("Highly Unpredictable")
+    ).select(
+        col("posting_year").cast(DecimalType(4, 0)),
+        col("posting_month").cast(DecimalType(2, 0)),
+        col("payment_predictability_index"),
+        col("interpretation")
+    )
+    
+    write_gold_table(result, "payment_predictability_index")
+def create_payment_timing_recommendation():
+    """Create payment_timing_recommendation table"""
+    logger.info("Creating payment_timing_recommendation")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create payment_timing_recommendation - missing source tables")
+        return
+    
+    df = sat_invoice.withColumn(
+        "days_until_due",
+        datediff(col("zfbdt"), current_date())
+    ).withColumn(
+        "recommendation",
+        when(col("days_until_due") < 0, "Pay Immediately")
+        .when(col("days_until_due") <= 10, "Pay Now for Discount")
+        .when(col("days_until_due") <= 30, "Schedule for Due Date")
+        .otherwise("No Action Required")
+    ).withColumn(
+        "rationale",
+        when(col("days_until_due") < 0, "Invoice is overdue - pay to avoid penalties")
+        .when(col("days_until_due") <= 10, "Early payment discount may be available")
+        .when(col("days_until_due") <= 30, "Pay on due date to optimize cash flow")
+        .otherwise("Invoice not due soon - monitor cash position")
+    )
+    
+    result = df.groupBy("recommendation", "rationale").agg(
+        spark_sum(col("rmwwr")).cast(DecimalType(10, 2)).alias("amount"),
+        count("*").cast(DecimalType(4, 0)).alias("invoice_count")
+    ).select(
+        col("recommendation"),
+        col("amount"),
+        col("invoice_count"),
+        col("rationale")
+    )
+    
+    write_gold_table(result, "payment_timing_recommendation")
+def create_net_early_payment_benefit_index():
+    """Create net_early_payment_benefit_index table"""
+    logger.info("Creating net_early_payment_benefit_index")
+    
+    sat_invoice = read_silver_table("sat", "SAT_INVOICE_RBKP")
+    sat_cleared = read_silver_table("sat", "SAT_CLEARED_ITEM_BSAK")
+    
+    if sat_invoice is None:
+        logger.warning("Cannot create net_early_payment_benefit_index - missing source tables")
+        return
+    
+    # Calculate potential discount savings
+    df = sat_invoice.withColumn(
+        "potential_discount",
+        coalesce(col("rmwwr"), lit(0)) * 0.02  # Assume 2% discount potential
+    )
+    
+    result = df.agg(
+        spark_sum(col("potential_discount")).cast(DecimalType(17, 11)).alias("total_net_benefit"),
+        spark_sum(col("rmwwr")).cast(DecimalType(11, 2)).alias("total_spend")
+    ).withColumn(
+        "nepbi_percent",
+        (col("total_net_benefit") / col("total_spend")).cast(DecimalType(12, 12))
+    )
+    
+    write_gold_table(result, "net_early_payment_benefit_index")
+# --------------------------------------------------------------
+# Main Execution
+# --------------------------------------------------------------
+def main():
+    logger.info("Starting Gold Layer (Information Mart) Job")
+    logger.info("=" * 60)
+    
+    # Create Dimension Tables
+    logger.info("Creating Dimension Tables...")
+    create_dim_company_code()
+    create_dim_vendor()
+    create_dim_plant()
+    create_dim_region()
+    create_dim_po()
+    
+    # Create Fact Tables
+    logger.info("Creating Fact Tables...")
+    create_invoice_status_history()
+    create_fact_sap_po_level()
+    
+    # Create Metric/KPI Tables
+    logger.info("Creating Metric/KPI Tables...")
+    create_accounts_payable_balance()
+    create_cash_flow_forecast()
+    create_cash_flow_unpaid_obligations()
+    create_days_payable_outstanding()
+    create_on_time_payment_rate()
+    create_late_payment_amount()
+    create_early_payment_candidates()
+    create_payment_processing_cycle_time()
+    create_supplier_delivery_accuracy_index()
+    create_gr_ir_aging()
+    create_gr_ir_outstanding_balance()
+    create_full_payment_rate()
+    create_partial_payment_rate()
+    create_duplicate_payments_for_invoice()
+    create_late_accruals()
+    create_weighted_days_payable_outstanding()
+    create_payment_predictability_index()
+    create_payment_timing_recommendation()
+    create_net_early_payment_benefit_index()
+    
+    logger.info("=" * 60)
+    logger.info("Gold Layer (Information Mart) Job Completed Successfully")
+if __name__ == "__main__":
+    main()
+    job.commit()

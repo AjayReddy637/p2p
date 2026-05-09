@@ -1,0 +1,527 @@
+import sys
+import json
+import logging
+import boto3
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, sha2, concat_ws, lit, current_timestamp, coalesce, trim, upper
+)
+from pyspark.sql.types import StringType, DecimalType
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+# --------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+config_bucket = "yignite-procurespendiq-miniature"
+bronze_db = "procureiqspend_bronze_sap"
+raw_vault_bucket = "yignite-procurespendiq-miniature"
+hub_path = "silver/raw_vault/hub"
+link_path = "silver/raw_vault/links"
+sat_path = "silver/raw_vault/satellites"
+# --------------------------------------------------------------
+# Spark Session
+# --------------------------------------------------------------
+spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+glueContext = GlueContext(spark.sparkContext)
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+# --------------------------------------------------------------
+# Data Vault Model Definition
+# --------------------------------------------------------------
+VAULT_MODEL = {
+    "hubs": [
+        {
+            "hub_name": "HUB_ACCOUNTING_DOC",
+            "business_key_columns": ["belnr", "bukrs", "gjahr"],
+            "source_tables": ["BKPF"]
+        },
+        {
+            "hub_name": "HUB_ACCT_DOC_LINE",
+            "business_key_columns": ["belnr", "bukrs", "gjahr", "buzei"],
+            "source_tables": ["BSEG"]
+        },
+        {
+            "hub_name": "HUB_CLEARED_ITEM",
+            "business_key_columns": ["belnr", "bukrs", "gjahr", "buzei"],
+            "source_tables": ["BSAK"]
+        },
+        {
+            "hub_name": "HUB_COMPANY_CODE",
+            "business_key_columns": ["bukrs"],
+            "source_tables": ["T001"]
+        },
+        {
+            "hub_name": "HUB_INVOICE",
+            "business_key_columns": ["belnr", "gjahr"],
+            "source_tables": ["RBKP"]
+        },
+        {
+            "hub_name": "HUB_INVOICE_LINE",
+            "business_key_columns": ["belnr", "gjahr", "buzei"],
+            "source_tables": ["RSEG"]
+        },
+        {
+            "hub_name": "HUB_MATERIAL_DOC",
+            "business_key_columns": ["mblnr", "mjahr"],
+            "source_tables": ["MKPF"]
+        },
+        {
+            "hub_name": "HUB_MAT_DOC_LINE",
+            "business_key_columns": ["mblnr", "mjahr", "zeession"],
+            "source_tables": ["MSEG"]
+        },
+        {
+            "hub_name": "HUB_PAYMENT_TERMS",
+            "business_key_columns": ["zterm"],
+            "source_tables": ["T052"]
+        },
+        {
+            "hub_name": "HUB_PLANT",
+            "business_key_columns": ["werks"],
+            "source_tables": ["T001W"]
+        },
+        {
+            "hub_name": "HUB_PURCHASE_ORDER",
+            "business_key_columns": ["ebeln"],
+            "source_tables": ["EKKO"]
+        },
+        {
+            "hub_name": "HUB_PO_LINE",
+            "business_key_columns": ["ebeln", "ebelp"],
+            "source_tables": ["EKPO"]
+        },
+        {
+            "hub_name": "HUB_VENDOR",
+            "business_key_columns": ["lifnr"],
+            "source_tables": ["LFA1", "LFB1"]
+        }
+    ],
+    "links": [
+        {
+            "link_name": "LINK_ACCT_DOC_LINE_VENDOR",
+            "hub_references": [
+                {"hub_name": "HUB_ACCT_DOC_LINE", "columns": ["belnr", "bukrs", "gjahr", "buzei"]},
+                {"hub_name": "HUB_VENDOR", "columns": ["lifnr"]}
+            ],
+            "source_tables": ["BSEG"]
+        },
+        {
+            "link_name": "LINK_CLEARED_ITEM_VENDOR",
+            "hub_references": [
+                {"hub_name": "HUB_CLEARED_ITEM", "columns": ["belnr", "bukrs", "gjahr", "buzei"]},
+                {"hub_name": "HUB_VENDOR", "columns": ["lifnr"]}
+            ],
+            "source_tables": ["BSAK"]
+        },
+        {
+            "link_name": "LINK_INVOICE_LINE_PO_LINE",
+            "hub_references": [
+                {"hub_name": "HUB_INVOICE_LINE", "columns": ["belnr", "gjahr", "buzei"]},
+                {"hub_name": "HUB_PO_LINE", "columns": ["ebeln", "ebelp"]}
+            ],
+            "source_tables": ["RSEG"]
+        },
+        {
+            "link_name": "LINK_INVOICE_VENDOR",
+            "hub_references": [
+                {"hub_name": "HUB_INVOICE", "columns": ["belnr", "gjahr"]},
+                {"hub_name": "HUB_VENDOR", "columns": ["lifnr"]}
+            ],
+            "source_tables": ["RBKP"]
+        },
+        {
+            "link_name": "LINK_MAT_DOC_LINE_PO_LINE",
+            "hub_references": [
+                {"hub_name": "HUB_MAT_DOC_LINE", "columns": ["mblnr", "mjahr", "zeession"]},
+                {"hub_name": "HUB_PO_LINE", "columns": ["ebeln", "ebelp"]}
+            ],
+            "source_tables": ["MSEG"]
+        },
+        {
+            "link_name": "LINK_VENDOR_COMPANY_CODE",
+            "hub_references": [
+                {"hub_name": "HUB_VENDOR", "columns": ["lifnr"]},
+                {"hub_name": "HUB_COMPANY_CODE", "columns": ["bukrs"]}
+            ],
+            "source_tables": ["LFB1"]
+        }
+    ],
+    "satellites": [
+        {
+            "sat_name": "SAT_ACCOUNTING_DOC_BKPF",
+            "hub_reference": "HUB_ACCOUNTING_DOC",
+            "hub_key_columns": ["belnr", "bukrs", "gjahr"],
+            "attributes": ["blart", "bldat", "budat", "monat", "cpudt", "cputm", "usnam", "tcode", "xblnr", "bktxt", "waers", "kursf", "wwert", "awtyp", "awkey"],
+            "source_table": "BKPF"
+        },
+        {
+            "sat_name": "SAT_ACCT_DOC_LINE_BSEG",
+            "hub_reference": "HUB_ACCT_DOC_LINE",
+            "hub_key_columns": ["belnr", "bukrs", "gjahr", "buzei"],
+            "attributes": ["bschl", "koart", "shkzg", "dmbtr", "wrbtr", "mwskz", "mwsts", "txjcd", "zuonr", "sgtxt", "kostl", "aufnr", "projk", "hkont", "kunnr", "lifnr", "matnr", "werks", "menge", "meins", "ebeln", "ebelp", "zekkn", "zfbdt", "zterm", "zbd1t", "zbd2t", "zbd3t", "skfbt", "sknto", "wskto", "zlsch", "zlspr", "zbfix", "augdt", "augbl", "augcp"],
+            "source_table": "BSEG"
+        },
+        {
+            "sat_name": "SAT_CLEARED_ITEM_BSAK",
+            "hub_reference": "HUB_CLEARED_ITEM",
+            "hub_key_columns": ["belnr", "bukrs", "gjahr", "buzei"],
+            "attributes": ["blart", "bldat", "budat", "monat", "cpudt", "waers", "dmbtr", "wrbtr", "shkzg", "augdt", "augbl", "zuonr", "sgtxt", "zfbdt", "zterm", "zbd1t", "zbd2t", "zbd3t", "skfbt", "sknto", "wskto"],
+            "source_table": "BSAK"
+        },
+        {
+            "sat_name": "SAT_COMPANY_T001",
+            "hub_reference": "HUB_COMPANY_CODE",
+            "hub_key_columns": ["bukrs"],
+            "attributes": ["butxt", "ort01", "land1", "waers", "spras", "adrnr", "stceg", "ktopl"],
+            "source_table": "T001"
+        },
+        {
+            "sat_name": "SAT_INVOICE_RBKP",
+            "hub_reference": "HUB_INVOICE",
+            "hub_key_columns": ["belnr", "gjahr"],
+            "attributes": ["blart", "bldat", "budat", "cpudt", "cputm", "usnam", "tcode", "xblnr", "lifnr", "waers", "kursf", "wmwst1", "rmwwr", "beznk", "mwskz1", "bupla", "sekko", "zterm", "zfbdt", "zlsch", "zlspr", "zbfix", "bvtyp", "xrech", "stblg", "stjah", "ivtyp", "erfpr"],
+            "source_table": "RBKP"
+        },
+        {
+            "sat_name": "SAT_INVOICE_LINE_RSEG",
+            "hub_reference": "HUB_INVOICE_LINE",
+            "hub_key_columns": ["belnr", "gjahr", "buzei"],
+            "attributes": ["ebeln", "ebelp", "zekkn", "matnr", "werks", "menge", "meins", "bpmng", "bprme", "netwr", "waers", "mwskz", "txjcd", "bstme", "bnkan", "shkzg", "kschl", "bwtar", "bwkey", "xblnr", "sgtxt", "bukrs", "lfbnr", "lfgja", "lfpos"],
+            "source_table": "RSEG"
+        },
+        {
+            "sat_name": "SAT_MATERIAL_DOC_MKPF",
+            "hub_reference": "HUB_MATERIAL_DOC",
+            "hub_key_columns": ["mblnr", "mjahr"],
+            "attributes": ["bldat", "budat", "cpudt", "cputm", "usnam", "tcode", "xblnr", "bktxt", "vgart", "blart", "blaum", "spession"],
+            "source_table": "MKPF"
+        },
+        {
+            "sat_name": "SAT_MAT_DOC_LINE_MSEG",
+            "hub_reference": "HUB_MAT_DOC_LINE",
+            "hub_key_columns": ["mblnr", "mjahr", "zeession"],
+            "attributes": ["bwart", "matnr", "werks", "lgort", "charg", "shkzg", "menge", "meins", "dmbtr", "waers", "bukrs", "ebeln", "ebelp", "zekkn", "lifnr", "sobkz", "kzbew", "kzzug", "kzvbr", "kostl", "aufnr", "rsnum", "rspos"],
+            "source_table": "MSEG"
+        },
+        {
+            "sat_name": "SAT_PAYMENT_TERMS_T052",
+            "hub_reference": "HUB_PAYMENT_TERMS",
+            "hub_key_columns": ["zterm"],
+            "attributes": ["ztagg", "ztag1", "ztag2", "ztag3", "zprz1", "zprz2", "zprz3", "zmession"],
+            "source_table": "T052"
+        },
+        {
+            "sat_name": "SAT_PLANT_T001W",
+            "hub_reference": "HUB_PLANT",
+            "hub_key_columns": ["werks"],
+            "attributes": ["name1", "name2", "stras", "ort01", "pstlz", "land1", "reession", "bukrs", "kunnr", "lifnr", "fabkl", "txjcd", "bedpl", "j_1bbession"],
+            "source_table": "T001W"
+        },
+        {
+            "sat_name": "SAT_PO_HEADER_EKKO",
+            "hub_reference": "HUB_PURCHASE_ORDER",
+            "hub_key_columns": ["ebeln"],
+            "attributes": ["bukrs", "bstyp", "bsart", "loession", "statu", "aedat", "ernam", "pincr", "lponr", "lifnr", "zterm", "ekorg", "ekgrp", "waers", "bedat", "kdatb", "kdate", "bwbdt", "gwldt", "ihrez", "verkf", "telf1", "llief", "kunnr", "wkurs", "kufix", "beession", "fession", "stceg", "stceg_l", "absgr", "addnr", "kornr", "memory", "procstat", "rlwrt", "revno", "scmproc", "reason_code", "memession", "retession", "dpession", "mession", "frggr", "frgsx", "frgke", "frgzu", "autession"],
+            "source_table": "EKKO"
+        },
+        {
+            "sat_name": "SAT_PO_LINE_EKPO",
+            "hub_reference": "HUB_PO_LINE",
+            "hub_key_columns": ["ebeln", "ebelp"],
+            "attributes": ["loession", "statu", "aedat", "txz01", "matnr", "ematn", "bukrs", "werks", "lgort", "bednr", "matkl", "infnr", "idnlf", "ktmng", "menge", "meins", "bprme", "bpumz", "bpumn", "netpr", "peinh", "netwr", "agdat", "webaz", "mwskz", "bonus", "insmk", "spinf", "prsdr", "schpr", "mahnz", "mahn1", "mahn2", "mahn3", "kzabs", "laession", "kzvbr", "vression", "twrkz", "wepos", "weunb", "repos", "webre", "kzwi1", "kzwi2", "kzwi3", "kzwi4", "kzwi5", "kzwi6", "sikgr", "mfession", "ffession", "afession", "uebpo", "uebto", "untto", "xersy", "xersf", "txjcd", "retpo", "sernp", "emlif", "lblkz"],
+            "source_table": "EKPO"
+        },
+        {
+            "sat_name": "SAT_PO_SCHEDULE_EKET",
+            "hub_reference": "HUB_PO_LINE",
+            "hub_key_columns": ["ebeln", "ebelp"],
+            "attributes": ["etenr", "eindt", "slfdt", "lpein", "menge", "ameng", "wemng", "wamng", "glmng", "nbgbn", "netwr", "banfn", "bnfpo", "esession", "aession"],
+            "source_table": "EKET"
+        },
+        {
+            "sat_name": "SAT_REGION_T005U",
+            "hub_reference": "HUB_COMPANY_CODE",
+            "hub_key_columns": ["bukrs"],
+            "attributes": ["spras", "land1", "bland", "bezei"],
+            "source_table": "T005U"
+        },
+        {
+            "sat_name": "SAT_VENDOR_LFA1",
+            "hub_reference": "HUB_VENDOR",
+            "hub_key_columns": ["lifnr"],
+            "attributes": ["name1", "name2", "name3", "name4", "stras", "ort01", "pstlz", "land1", "reession", "telf1", "telf2", "telfx", "stcd1", "stcd2", "spras", "brsch", "ktokk", "loevm", "sperr", "aufsd", "lifsd", "eession", "gbort", "dtaws", "dtams", "adrnr"],
+            "source_table": "LFA1"
+        },
+        {
+            "sat_name": "SAT_VENDOR_BKP_LFA1",
+            "hub_reference": "HUB_VENDOR",
+            "hub_key_columns": ["lifnr"],
+            "attributes": ["name1", "name2", "name3", "name4", "stras", "ort01", "pstlz", "land1", "reession"],
+            "source_table": "BKP_LFA1"
+        },
+        {
+            "sat_name": "SAT_VENDOR_LFB1",
+            "hub_reference": "HUB_VENDOR",
+            "hub_key_columns": ["lifnr"],
+            "attributes": ["bukrs", "pernr", "ernam", "erdat", "akession", "loevm", "sperr", "zuession", "busab", "zterm", "zwels", "xession", "zahls", "eikto", "hbkid", "xinve", "hession", "alession", "kression", "qsession", "qsznr", "qszdt", "wession", "cession"],
+            "source_table": "LFB1"
+        },
+        {
+            "sat_name": "SAT_INVOICE_STATUS_LOG",
+            "hub_reference": "HUB_INVOICE",
+            "hub_key_columns": ["belnr", "gjahr"],
+            "attributes": ["status", "effective_date", "sequence_nbr", "status_notes", "created_by", "created_at"],
+            "source_table": "INVOICE_STATUS_LOG"
+        }
+    ]
+}
+# --------------------------------------------------------------
+# Helper Functions
+# --------------------------------------------------------------
+def find_column(df, col_name):
+    """Case-insensitive column lookup"""
+    for c in df.columns:
+        if c.lower() == col_name.lower():
+            return c
+    return None
+def get_existing_columns(df, columns):
+    """Return list of columns that exist in the DataFrame"""
+    existing = []
+    for c in columns:
+        found = find_column(df, c)
+        if found:
+            existing.append(found)
+    return existing
+def write_to_s3(df, s3_path, mode="overwrite"):
+    """Write DataFrame to S3 as Parquet"""
+    full_path = f"s3://{raw_vault_bucket}/{s3_path}"
+    df.write.mode(mode).parquet(full_path)
+    logger.info("Written %d rows to %s", df.count(), full_path)
+def read_bronze_table(table_name):
+    """Read a table from bronze database"""
+    try:
+        df = spark.table(f"{bronze_db}.{table_name.lower()}")
+        logger.info("Read table %s with %d columns", table_name, len(df.columns))
+        return df
+    except Exception as e:
+        logger.warning("Could not read table %s: %s", table_name, e)
+        return None
+def generate_hash_key(df, columns, key_name="hash_key"):
+    """Generate SHA-256 hash key from multiple columns"""
+    existing_cols = get_existing_columns(df, columns)
+    if not existing_cols:
+        return None
+    concat_expr = concat_ws("||", *[coalesce(col(c).cast(StringType()), lit("")).alias(c) for c in existing_cols])
+    return df.withColumn(key_name, sha2(concat_expr, 256))
+# --------------------------------------------------------------
+# Create HUB Tables
+# --------------------------------------------------------------
+def create_hubs():
+    logger.info("=" * 60)
+    logger.info("Creating HUB Tables")
+    logger.info("=" * 60)
+    
+    hub_dataframes = {}
+    
+    for hub in VAULT_MODEL["hubs"]:
+        hub_name = hub["hub_name"]
+        bk_columns = hub["business_key_columns"]
+        source_tables = hub["source_tables"]
+        
+        logger.info("Building HUB: %s from sources: %s", hub_name, source_tables)
+        
+        hub_dfs = []
+        for src_table in source_tables:
+            src_df = read_bronze_table(src_table)
+            if src_df is None:
+                continue
+            
+            existing_bk_cols = get_existing_columns(src_df, bk_columns)
+            if not existing_bk_cols:
+                logger.warning("No business key columns found in %s for %s", src_table, hub_name)
+                continue
+            
+            # Select business key columns and add metadata
+            select_cols = [col(c).alias(c.lower()) for c in existing_bk_cols]
+            key_df = src_df.select(*select_cols).distinct()
+            
+            # Generate hash key
+            concat_expr = concat_ws("||", *[coalesce(col(c.lower()).cast(StringType()), lit("")) for c in existing_bk_cols])
+            key_df = key_df.withColumn("hub_hash_key", sha2(concat_expr, 256))
+            key_df = key_df.withColumn("load_date", current_timestamp())
+            key_df = key_df.withColumn("record_source", lit(src_table))
+            
+            # Create business_key as concatenated string for reference
+            key_df = key_df.withColumn("business_key", concat_ws("|", *[col(c.lower()) for c in existing_bk_cols]))
+            
+            hub_dfs.append(key_df)
+        
+        if not hub_dfs:
+            logger.warning("No data for HUB %s", hub_name)
+            continue
+        
+        # Union all sources
+        hub_df = hub_dfs[0]
+        for df in hub_dfs[1:]:
+            hub_df = hub_df.unionByName(df, allowMissingColumns=True)
+        
+        hub_df = hub_df.dropDuplicates(["hub_hash_key"])
+        
+        # Write to S3
+        write_to_s3(hub_df, f"{hub_path}/{hub_name}")
+        hub_dataframes[hub_name] = f"s3://{raw_vault_bucket}/{hub_path}/{hub_name}"
+    
+    return hub_dataframes
+# --------------------------------------------------------------
+# Create SATELLITE Tables
+# --------------------------------------------------------------
+def create_satellites(hub_paths):
+    logger.info("=" * 60)
+    logger.info("Creating SATELLITE Tables")
+    logger.info("=" * 60)
+    
+    for sat in VAULT_MODEL["satellites"]:
+        sat_name = sat["sat_name"]
+        hub_ref = sat["hub_reference"]
+        hub_key_columns = sat["hub_key_columns"]
+        attributes = sat["attributes"]
+        source_table = sat["source_table"]
+        
+        logger.info("Building SATELLITE: %s from source: %s", sat_name, source_table)
+        
+        # Read source table
+        src_df = read_bronze_table(source_table)
+        if src_df is None:
+            logger.warning("Could not read source table %s for satellite %s", source_table, sat_name)
+            continue
+        
+        # Get existing hub key columns
+        existing_hub_keys = get_existing_columns(src_df, hub_key_columns)
+        if not existing_hub_keys:
+            logger.warning("No hub key columns found in %s for %s", source_table, sat_name)
+            continue
+        
+        # Get existing attribute columns
+        existing_attrs = get_existing_columns(src_df, attributes)
+        if not existing_attrs:
+            logger.warning("No attribute columns found in %s for %s", source_table, sat_name)
+            continue
+        
+        # Generate hub hash key
+        concat_expr = concat_ws("||", *[coalesce(col(c).cast(StringType()), lit("")) for c in existing_hub_keys])
+        sat_df = src_df.withColumn("hub_hash_key", sha2(concat_expr, 256))
+        
+        # Generate hash diff for change detection
+        attr_concat = concat_ws("||", *[coalesce(col(c).cast(StringType()), lit("")) for c in existing_attrs])
+        sat_df = sat_df.withColumn("hash_diff", sha2(attr_concat, 256))
+        
+        # Add metadata
+        sat_df = sat_df.withColumn("load_date", current_timestamp())
+        sat_df = sat_df.withColumn("record_source", lit(source_table))
+        
+        # Select final columns
+        select_cols = ["hub_hash_key"] + [col(c).alias(c.lower()) for c in existing_attrs] + ["hash_diff", "load_date", "record_source"]
+        sat_df = sat_df.select(*select_cols).distinct()
+        
+        # Write to S3
+        write_to_s3(sat_df, f"{sat_path}/{sat_name}")
+# --------------------------------------------------------------
+# Create LINK Tables
+# --------------------------------------------------------------
+def create_links(hub_paths):
+    logger.info("=" * 60)
+    logger.info("Creating LINK Tables")
+    logger.info("=" * 60)
+    
+    for link in VAULT_MODEL["links"]:
+        link_name = link["link_name"]
+        hub_references = link["hub_references"]
+        source_tables = link["source_tables"]
+        
+        logger.info("Building LINK: %s from sources: %s", link_name, source_tables)
+        
+        link_dfs = []
+        for src_table in source_tables:
+            src_df = read_bronze_table(src_table)
+            if src_df is None:
+                continue
+            
+            # Generate hash keys for each hub reference
+            current_df = src_df
+            hub_hash_keys = []
+            valid = True
+            
+            for i, ref in enumerate(hub_references):
+                hub_name = ref["hub_name"]
+                ref_columns = ref["columns"]
+                
+                existing_cols = get_existing_columns(current_df, ref_columns)
+                if not existing_cols:
+                    logger.warning("Columns %s not found in %s for link %s", ref_columns, src_table, link_name)
+                    valid = False
+                    break
+                
+                # Generate hash key for this hub reference
+                concat_expr = concat_ws("||", *[coalesce(col(c).cast(StringType()), lit("")) for c in existing_cols])
+                hash_col_name = f"hk_{hub_name}"
+                current_df = current_df.withColumn(hash_col_name, sha2(concat_expr, 256))
+                hub_hash_keys.append(hash_col_name)
+            
+            if not valid:
+                continue
+            
+            # Generate link hash key
+            link_hash_expr = concat_ws("||", *[col(hk) for hk in hub_hash_keys])
+            current_df = current_df.withColumn("link_hash_key", sha2(link_hash_expr, 256))
+            
+            # Add metadata
+            current_df = current_df.withColumn("load_date", current_timestamp())
+            current_df = current_df.withColumn("record_source", lit(src_table))
+            
+            # Select final columns
+            select_cols = ["link_hash_key"] + hub_hash_keys + ["load_date", "record_source"]
+            current_df = current_df.select(*select_cols).distinct()
+            
+            link_dfs.append(current_df)
+        
+        if not link_dfs:
+            logger.warning("No data for LINK %s", link_name)
+            continue
+        
+        # Union all sources
+        link_df = link_dfs[0]
+        for df in link_dfs[1:]:
+            link_df = link_df.unionByName(df, allowMissingColumns=True)
+        
+        link_df = link_df.dropDuplicates(["link_hash_key"])
+        
+        # Write to S3
+        write_to_s3(link_df, f"{link_path}/{link_name}")
+# --------------------------------------------------------------
+# Main Execution
+# --------------------------------------------------------------
+def main():
+    logger.info("Starting Silver Layer (Raw Vault) Job")
+    logger.info("=" * 60)
+    
+    # Create HUBs first
+    hub_paths = create_hubs()
+    
+    # Create SATELLITEs
+    create_satellites(hub_paths)
+    
+    # Create LINKs
+    create_links(hub_paths)
+    
+    logger.info("=" * 60)
+    logger.info("Silver Layer (Raw Vault) Job Completed Successfully")
+if __name__ == "__main__":
+    main()
+    job.commit()

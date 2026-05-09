@@ -1,0 +1,4 @@
+Job Name,Layer,Purpose
+procureiq-spend-raw-vault-job,Silver,"Creates Data Vault 2.0 structures (Hubs, Links, Satellites) from bronze SAP tables"
+procureiq-spend-gold-vault-job,Gold,Transforms Data Vault into dimensional model (dim/fact tables) and calculates KPIs
+procureiq-spend-consumption-vault-job,Consumption,Creates views on gold tables and registers them in Glue Data Catalog

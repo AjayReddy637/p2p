@@ -1,0 +1,393 @@
+import sys
+import logging
+import boto3
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, row_number, lit
+from pyspark.sql.window import Window
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+# --------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+bucket = "yignite-procurespendiq-miniature"
+gold_path = f"s3://{bucket}/gold/information_mart"
+consumption_path = f"s3://{bucket}/consumption/views"
+
+# Glue Catalog configuration
+glue_database = "procureiqspend_consumption"
+glue_client = boto3.client('glue', region_name='us-east-1')
+
+# --------------------------------------------------------------
+# Spark Session
+# --------------------------------------------------------------
+spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+glueContext = GlueContext(spark.sparkContext)
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# --------------------------------------------------------------
+# View Definitions
+# This maps consumption view names to their source gold tables
+# and any transformations needed
+# --------------------------------------------------------------
+VIEW_DEFINITIONS = {
+    # Dimension Views
+    "accounts_payable_balance_vw": {
+        "source_table": "accounts_payable_balance",
+        "columns": ["year", "month", "ap_balance", "invoice_count"]
+    },
+    "cash_flow_forecast_vw": {
+        "source_table": "cash_flow_forecast",
+        "columns": ["forecast_bucket", "invoice_count", "total_amount", "earliest_due", "latest_due"]
+    },
+    "cash_flow_unpaid_obligations_vw": {
+        "source_table": "cash_flow_unpaid_obligations",
+        "columns": ["document_number", "vendor_id", "invoice_amount_local", "due_date", "invoice_status", "days_until_due"]
+    },
+    "days_payable_outstanding_vw": {
+        "source_table": "days_payable_outstanding",
+        "columns": ["invoice_number", "year", "month", "avg_trade_payables", "cogs_amount", "dpo"]
+    },
+    "dim_company_code_vw": {
+        "source_table": "dim_company_code",
+        "columns": ["company_code", "company_name", "city", "country_code", "currency", "postal_code", "street", "region_code", "vat_reg_number", "chart_of_accounts", "system"]
+    },
+    "dim_plant_vw": {
+        "source_table": "dim_plant",
+        "columns": ["plant_code", "plant_name", "plant_name_2", "company_code", "country_code", "region_code", "city", "postal_code", "street", "system"]
+    },
+    "dim_po_vw": {
+        "source_table": "dim_po",
+        "columns": ["purchase_order_number", "po_item", "po_amount", "vendor_id", "company_code", "po_date", "po_created_date", "po_doc_type", "po_payment_terms", "purchasing_org", "purchasing_group", "po_currency", "po_release_status", "delivery_date", "quantity_delivered", "quantity_remaining", "po_due_date"]
+    },
+    "dim_region_vw": {
+        "source_table": "dim_region",
+        "columns": ["country_code", "region_code", "region_name"]
+    },
+    "dim_vendor_vw": {
+        "source_table": "dim_vendor",
+        "columns": ["vendor_id", "vendor_name", "vendor_name_2", "country_code", "city", "postal_code", "street", "region_code", "tax_number_1", "tax_number_2", "industry_sector", "vendor_account_group", "deletion_flag", "posting_block", "system"]
+    },
+    "duplicate_payments_for_invoice_vw": {
+        "source_table": "duplicate_payments_for_invoice",
+        "columns": ["invoice_number", "year", "month", "duplicate_payment_amount", "total_payments", "duplicate_payment_rate"]
+    },
+    "early_payment_candidates_vw": {
+        "source_table": "early_payment_candidates",
+        "columns": ["document_number", "vendor_id", "vendor_name", "invoice_amount_local", "due_date", "days_until_due", "savings_if_2pct_discount", "vendor_tier", "early_pay_priority"]
+    },
+    "fact_sap_po_level_vw": {
+        "source_table": "fact_sap_po_level",
+        "columns": ["posting_year", "posting_month", "delivery_date", "po_date", "received_qty", "ordered_qty", "po_amount"]
+    },
+    "full_payment_rate_vw": {
+        "source_table": "full_payment_rate",
+        "columns": ["year", "month", "full_paid_invoices", "total_cleared_invoices", "full_payment_rate_pct"]
+    },
+    "gr_ir_aging_vw": {
+        "source_table": "gr_ir_aging",
+        "columns": ["year", "month", "age_days", "total_grir_balance", "grir_over_30", "grir_over_60", "grir_over_90", "pct_grir_over_30", "pct_grir_over_60", "pct_grir_over_90", "cnt_grir_over_30", "cnt_grir_over_60", "cnt_grir_over_90"]
+    },
+    "gr_ir_outstanding_balance_vw": {
+        "source_table": "gr_ir_outstanding_balance",
+        "columns": ["year", "month", "invoice_count", "total_grir_blnc"]
+    },
+    "invoice_status_history_vw": {
+        "source_table": "invoice_status_history",
+        "columns": ["invoice_number", "company_code", "plant_code", "fiscal_year", "status", "effective_date", "sequence_nbr", "status_notes", "posting_date", "document_date", "vendor_id", "currency", "invoice_amount_local", "payment_terms", "document_type", "accrual_indicator", "due_date", "invoice_receipt_date", "gl_account", "baseline_date", "payment_date", "clearing_document", "aging_days", "purchase_order_reference", "po_amount", "po_purpose", "discount_percent", "discount_days", "net_due_days", "region", "system"]
+    },
+    "late_accruals_vw": {
+        "source_table": "late_accruals",
+        "columns": ["year", "month", "late_accrual_amount", "late_accrual_count", "total_accrual_amount", "late_accrual_rate_pct"]
+    },
+    "late_payment_amount_vw": {
+        "source_table": "late_payment_amount",
+        "columns": ["year", "month", "late_payment_amount", "late_payment_count", "total_payment_amount", "late_payment_rate_pct"]
+    },
+    "net_early_payment_benefit_index_vw": {
+        "source_table": "net_early_payment_benefit_index",
+        "columns": ["total_net_benefit", "total_spend", "nepbi_percent"]
+    },
+    "on_time_payment_rate_vw": {
+        "source_table": "on_time_payment_rate",
+        "columns": ["year", "month", "on_time_payments", "total_payments", "on_time_payment_rate_pct"]
+    },
+    "partial_payment_rate_vw": {
+        "source_table": "partial_payment_rate",
+        "columns": ["year", "month", "partial_paid_invoices", "total_paid_invoices", "partial_payment_rate_pct"]
+    },
+    "payment_predictability_index_vw": {
+        "source_table": "payment_predictability_index",
+        "columns": ["posting_year", "posting_month", "payment_predictability_index", "interpretation"]
+    },
+    "payment_processing_cycle_time_vw": {
+        "source_table": "payment_processing_cycle_time",
+        "columns": ["year", "month", "avg_payment_cycle_time_days", "min_cycle_time_days", "max_cycle_time_days", "cleared_invoices"]
+    },
+    "payment_timing_recommendation_vw": {
+        "source_table": "payment_timing_recommendation",
+        "columns": ["recommendation", "amount", "invoice_count", "rationale"]
+    },
+    "supplier_delivery_accuracy_index_vw": {
+        "source_table": "supplier_delivery_accuracy_index",
+        "columns": ["year", "month", "on_time_deliveries", "total_deliveries", "delivery_accuracy_pct"]
+    },
+    "weighted_days_payable_outstanding_vw": {
+        "source_table": "weighted_days_payable_outstanding",
+        "columns": ["year", "month", "total_payables", "total_cogs", "weighted_dpo"]
+    }
+}
+
+# Special view: fact_all_sources_vw requires transformation
+FACT_ALL_SOURCES_VW = {
+    "view_name": "fact_all_sources_vw",
+    "source_table": "invoice_status_history",
+    "transformation": "row_number_latest"
+}
+
+# --------------------------------------------------------------
+# Helper Functions
+# --------------------------------------------------------------
+def read_gold_table(table_name):
+    """Read a table from gold layer"""
+    path = f"{gold_path}/{table_name}"
+    try:
+        df = spark.read.parquet(path)
+        logger.info("Read gold table %s with %d rows", table_name, df.count())
+        return df
+    except Exception as e:
+        logger.warning("Could not read gold table %s: %s", table_name, e)
+        return None
+
+def write_consumption_view(df, view_name, mode="overwrite"):
+    """Write DataFrame to consumption layer and register in Glue Catalog"""
+    path = f"{consumption_path}/{view_name}"
+    df.write.mode(mode).parquet(path)
+    logger.info("Written %d rows to %s", df.count(), path)
+    
+    # Register table in Glue Catalog
+    register_glue_table(view_name, path, df.schema)
+
+def ensure_database_exists():
+    """Create the Glue database if it doesn't exist"""
+    try:
+        glue_client.get_database(Name=glue_database)
+        logger.info("Database %s already exists", glue_database)
+    except glue_client.exceptions.EntityNotFoundException:
+        logger.info("Creating database %s", glue_database)
+        glue_client.create_database(
+            DatabaseInput={
+                'Name': glue_database,
+                'Description': 'ProcureIQ Spend Consumption Layer Views'
+            }
+        )
+
+def register_glue_table(table_name, s3_path, schema):
+    """Register or update a table in the Glue Data Catalog"""
+    columns = []
+    for field in schema.fields:
+        glue_type = spark_type_to_glue_type(field.dataType)
+        columns.append({
+            'Name': field.name,
+            'Type': glue_type
+        })
+    
+    table_input = {
+        'Name': table_name,
+        'Description': f'Consumption view: {table_name}',
+        'StorageDescriptor': {
+            'Columns': columns,
+            'Location': s3_path,
+            'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
+            'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
+            'SerdeInfo': {
+                'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe',
+                'Parameters': {'serialization.format': '1'}
+            },
+            'Compressed': True
+        },
+        'TableType': 'EXTERNAL_TABLE',
+        'Parameters': {
+            'classification': 'parquet',
+            'compressionType': 'snappy'
+        }
+    }
+    
+    try:
+        glue_client.get_table(DatabaseName=glue_database, Name=table_name)
+        # Table exists, update it
+        glue_client.update_table(
+            DatabaseName=glue_database,
+            TableInput=table_input
+        )
+        logger.info("Updated Glue table: %s.%s", glue_database, table_name)
+    except glue_client.exceptions.EntityNotFoundException:
+        # Table doesn't exist, create it
+        glue_client.create_table(
+            DatabaseName=glue_database,
+            TableInput=table_input
+        )
+        logger.info("Created Glue table: %s.%s", glue_database, table_name)
+
+def spark_type_to_glue_type(spark_type):
+    """Convert Spark data type to Glue/Hive data type"""
+    type_name = str(spark_type)
+    
+    if 'DecimalType' in type_name:
+        # Extract precision and scale from DecimalType(p,s)
+        import re
+        match = re.search(r'DecimalType\((\d+),\s*(\d+)\)', type_name)
+        if match:
+            return f"decimal({match.group(1)},{match.group(2)})"
+        return "decimal(10,2)"
+    elif 'StringType' in type_name:
+        return 'string'
+    elif 'IntegerType' in type_name:
+        return 'int'
+    elif 'LongType' in type_name:
+        return 'bigint'
+    elif 'DoubleType' in type_name:
+        return 'double'
+    elif 'FloatType' in type_name:
+        return 'float'
+    elif 'DateType' in type_name:
+        return 'date'
+    elif 'TimestampType' in type_name:
+        return 'timestamp'
+    elif 'BooleanType' in type_name:
+        return 'boolean'
+    else:
+        return 'string'
+
+def get_available_columns(df, requested_columns):
+    """Get list of columns that exist in the DataFrame"""
+    df_cols_lower = {c.lower(): c for c in df.columns}
+    available = []
+    for col_name in requested_columns:
+        if col_name.lower() in df_cols_lower:
+            available.append(df_cols_lower[col_name.lower()])
+    return available
+
+# --------------------------------------------------------------
+# Create Standard Views
+# --------------------------------------------------------------
+def create_standard_views():
+    """Create all standard views from gold tables"""
+    logger.info("Creating standard consumption views...")
+    
+    for view_name, view_def in VIEW_DEFINITIONS.items():
+        source_table = view_def["source_table"]
+        requested_columns = view_def["columns"]
+        
+        logger.info("Creating view: %s from source: %s", view_name, source_table)
+        
+        # Read source table
+        df = read_gold_table(source_table)
+        if df is None:
+            logger.warning("Skipping view %s - source table %s not found", view_name, source_table)
+            continue
+        
+        # Select available columns
+        available_cols = get_available_columns(df, requested_columns)
+        if not available_cols:
+            logger.warning("Skipping view %s - no matching columns found", view_name)
+            continue
+        
+        # Create view DataFrame
+        view_df = df.select([col(c) for c in available_cols])
+        
+        # Rename columns to lowercase to match view definition
+        for old_col, new_col in zip(available_cols, [c.lower() for c in available_cols]):
+            if old_col != new_col:
+                view_df = view_df.withColumnRenamed(old_col, new_col)
+        
+        # Write view
+        write_consumption_view(view_df, view_name)
+
+# --------------------------------------------------------------
+# Create Special Views
+# --------------------------------------------------------------
+def create_fact_all_sources_view():
+    """Create fact_all_sources_vw with special transformation"""
+    logger.info("Creating fact_all_sources_vw...")
+    
+    df = read_gold_table("invoice_status_history")
+    if df is None:
+        logger.warning("Cannot create fact_all_sources_vw - source table not found")
+        return
+    
+    # Apply ROW_NUMBER to get latest status per invoice
+    window_spec = Window.partitionBy("invoice_number", "company_code", "fiscal_year") \
+                        .orderBy(col("sequence_nbr").desc())
+    
+    df = df.withColumn("row_num", row_number().over(window_spec))
+    df = df.filter(col("row_num") == 1).drop("row_num")
+    
+    # Select and rename columns for fact_all_sources_vw
+    result = df.select(
+        col("invoice_number").alias("document_number"),
+        col("invoice_number"),
+        col("company_code"),
+        col("plant_code"),
+        col("fiscal_year"),
+        col("posting_date"),
+        col("document_date"),
+        col("vendor_id"),
+        col("currency"),
+        col("invoice_amount_local"),
+        col("invoice_amount_local").alias("invoice_amount_document"),
+        col("gl_account"),
+        col("baseline_date"),
+        col("payment_terms"),
+        col("status").alias("invoice_status"),
+        col("status_notes"),
+        col("payment_date"),
+        col("clearing_document"),
+        col("aging_days"),
+        col("purchase_order_reference"),
+        col("po_amount"),
+        col("po_purpose"),
+        col("document_type"),
+        col("accrual_indicator"),
+        col("due_date"),
+        col("invoice_receipt_date"),
+        col("discount_percent"),
+        col("discount_days"),
+        col("net_due_days"),
+        col("region"),
+        col("system")
+    )
+    
+    write_consumption_view(result, "fact_all_sources_vw")
+
+# --------------------------------------------------------------
+# Main Execution
+# --------------------------------------------------------------
+def main():
+    logger.info("Starting Consumption Layer Job")
+    logger.info("=" * 60)
+    
+    # Ensure database exists
+    ensure_database_exists()
+    
+    # Create standard views
+    create_standard_views()
+    
+    # Create special views
+    create_fact_all_sources_view()
+    
+    logger.info("=" * 60)
+    logger.info("Consumption Layer Job Completed Successfully")
+
+if __name__ == "__main__":
+    main()
+    job.commit()
