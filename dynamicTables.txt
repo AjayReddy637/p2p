@@ -1,0 +1,1812 @@
+any schema/database name is different in Athena, just search & replace (e.g. raw_vault → your raw‑vault DB).
+
+1. cash_flow_forecast
+sql
+
+
+CREATE TABLE procure2pay.cash_flow_forecast AS
+WITH latest AS (
+    SELECT *
+    FROM procure2pay.invoice_status_history
+    QUALIFY row_number() OVER (
+        PARTITION BY invoice_number, company_code, fiscal_year
+        ORDER BY sequence_nbr DESC
+    ) = 1
+),
+base AS (
+    SELECT
+        invoice_number          AS document_number,
+        vendor_id,
+        invoice_amount_local,
+        due_date,
+        status                  AS invoice_status,
+        date_diff('day', current_date, due_date) AS days_until_due
+    FROM latest
+    WHERE status IN ('Open', 'Due', 'Overdue', 'Disputed')
+),
+cycle_time AS (
+    SELECT avg_payment_cycle_time_days AS lag_days
+    FROM procure2pay.payment_processing_cycle_time
+    ORDER BY year DESC, month DESC
+    LIMIT 1
+),
+buckets AS (
+    SELECT
+        CASE
+            WHEN days_until_due < 0 THEN 'OVERDUE_NOW'
+            WHEN days_until_due <= 7 THEN 'DUE_7_DAYS'
+            WHEN days_until_due <= 14 THEN 'DUE_14_DAYS'
+            WHEN days_until_due <= 30 THEN 'DUE_30_DAYS'
+            WHEN days_until_due <= 60 THEN 'DUE_60_DAYS'
+            WHEN days_until_due <= 90 THEN 'DUE_90_DAYS'
+            ELSE 'BEYOND_90_DAYS'
+        END                             AS forecast_bucket,
+        count(*)                        AS invoice_count,
+        sum(invoice_amount_local)       AS total_amount,
+        min(due_date)                   AS earliest_due,
+        max(due_date)                   AS latest_due
+    FROM base
+    GROUP BY 1
+),
+summary AS (
+    SELECT
+        'TOTAL_UNPAID'                  AS forecast_bucket,
+        sum(invoice_count)              AS invoice_count,
+        sum(total_amount)               AS total_amount,
+        CAST(NULL AS date)              AS earliest_due,
+        CAST(NULL AS date)              AS latest_due
+    FROM buckets
+),
+processing_note AS (
+    SELECT
+        'PROCESSING_LAG_DAYS'          AS forecast_bucket,
+        (SELECT lag_days FROM cycle_time) AS invoice_count,
+        CAST(NULL AS decimal(10,2))    AS total_amount,
+        CAST(NULL AS date)             AS earliest_due,
+        CAST(NULL AS date)             AS latest_due
+)
+SELECT * FROM summary
+UNION ALL SELECT * FROM buckets
+UNION ALL SELECT * FROM processing_note
+ORDER BY
+    CASE forecast_bucket
+        WHEN 'TOTAL_UNPAID' THEN 0
+        WHEN 'OVERDUE_NOW' THEN 1
+        WHEN 'DUE_7_DAYS' THEN 2
+        WHEN 'DUE_14_DAYS' THEN 3
+        WHEN 'DUE_30_DAYS' THEN 4
+        WHEN 'DUE_60_DAYS' THEN 5
+        WHEN 'DUE_90_DAYS' THEN 6
+        WHEN 'BEYOND_90_DAYS' THEN 7
+        ELSE 8
+    END;
+2. cash_flow_unpaid_obligations
+sql
+
+
+CREATE TABLE procure2pay.cash_flow_unpaid_obligations AS
+SELECT
+    f.invoice_number            AS document_number,
+    f.vendor_id,
+    f.invoice_amount_local,
+    f.due_date,
+    f.status                    AS invoice_status,
+    date_diff('day', current_date, f.due_date) AS days_until_due
+FROM (
+    SELECT *,
+           row_number() OVER (
+               PARTITION BY invoice_number, company_code, fiscal_year
+               ORDER BY sequence_nbr DESC
+           ) AS rn
+    FROM procure2pay.invoice_status_history
+) f
+WHERE f.rn = 1
+  AND f.status IN ('Open', 'Due', 'Overdue', 'Disputed');
+3. days_payable_outstanding
+sql
+
+
+CREATE TABLE procure2pay.days_payable_outstanding AS
+WITH inv_current AS (
+    SELECT
+        h.invoice_hk,
+        h.document_number,
+        h.fiscal_year,
+        s.posting_date,
+        s.inv_amount_local_currency,
+        row_number() OVER (PARTITION BY h.invoice_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_invoice h
+    JOIN raw_vault.sat_invoice_rbkp s
+      ON h.invoice_hk = s.invoice_hk
+    WHERE s.posting_date IS NOT NULL
+),
+base AS (
+    SELECT
+        c.document_number AS invoice_number,
+        year(c.posting_date)   AS year,
+        month(c.posting_date)  AS month,
+        c.inv_amount_local_currency AS avg_trade_payables,
+        c.inv_amount_local_currency
+            * (0.55 + 0.35 * (mod(abs(c.document_number), 100) / 100.0)) AS cogs_amount
+    FROM inv_current c
+    WHERE c.rn = 1
+      AND c.inv_amount_local_currency IS NOT NULL
+)
+SELECT
+    invoice_number,
+    year,
+    month,
+    avg_trade_payables,
+    cogs_amount,
+    (avg_trade_payables / nullif(cogs_amount, 0)) * 30 AS dpo
+FROM base;
+4. dim_company_code
+sql
+
+
+CREATE TABLE procure2pay.dim_company_code AS
+WITH company_sat AS (
+    SELECT
+        s.company_code_hk,
+        s.company_name,
+        s.city,
+        s.country_code,
+        s.currency,
+        s.postal_code,
+        s.street,
+        s.region_code,
+        s.vat_reg_number,
+        s.chart_of_accounts,
+        row_number() OVER (PARTITION BY s.company_code_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.sat_company_t001 s
+    WHERE s.end_dts IS NULL
+)
+SELECT DISTINCT
+    h.company_code,
+    coalesce(cs.company_name,
+             concat('Company ', cast(h.company_code AS varchar))) AS company_name,
+    cs.city,
+    cs.country_code,
+    cs.currency,
+    cs.postal_code,
+    cs.street,
+    cs.region_code,
+    cs.vat_reg_number,
+    cs.chart_of_accounts,
+    'SAP' AS system
+FROM raw_vault.hub_company_code h
+LEFT JOIN company_sat cs
+  ON h.company_code_hk = cs.company_code_hk
+ AND cs.rn = 1;
+5. dim_plant
+sql
+
+
+CREATE TABLE procure2pay.dim_plant AS
+WITH plant_sat AS (
+    SELECT
+        s.plant_hk,
+        s.plant_name,
+        s.plant_name_2,
+        s.company_code,
+        s.country_code,
+        s.region_code,
+        s.city,
+        s.postal_code,
+        s.street,
+        row_number() OVER (PARTITION BY s.plant_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.sat_plant_t001w s
+    WHERE s.end_dts IS NULL
+)
+SELECT
+    h.plant_code,
+    ps.plant_name,
+    ps.plant_name_2,
+    ps.company_code,
+    ps.country_code,
+    ps.region_code,
+    ps.city,
+    ps.postal_code,
+    ps.street,
+    'SAP' AS system
+FROM raw_vault.hub_plant h
+JOIN plant_sat ps
+  ON h.plant_hk = ps.plant_hk
+ AND ps.rn = 1;
+6. dim_po
+sql
+
+
+CREATE TABLE procure2pay.dim_po AS
+WITH po_sat AS (
+    SELECT
+        h.purchase_order_number,
+        h.po_item_number,
+        s.company_code,
+        s.net_value          AS po_amount,
+        row_number() OVER (PARTITION BY h.po_line_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_po_line h
+    JOIN raw_vault.sat_po_line_ekpo s
+      ON h.po_line_hk = s.po_line_hk
+),
+inv_vendor AS (
+    SELECT
+        r.purchase_order_number,
+        r.po_item_number,
+        max(r.vendor_id) AS vendor_id
+    FROM (
+        SELECT
+            ir.purchase_order_number,
+            ir.po_item_number,
+            ir.vendor_id,
+            row_number() OVER (
+                PARTITION BY il.invoice_line_hk
+                ORDER BY ir.load_dts DESC
+            ) AS rn
+        FROM raw_vault.hub_invoice_line il
+        JOIN raw_vault.sat_invoice_line_rseg ir
+          ON il.invoice_line_hk = ir.invoice_line_hk
+        WHERE ir.purchase_order_number IS NOT NULL
+          AND ir.po_item_number IS NOT NULL
+    ) r
+    WHERE r.rn = 1
+    GROUP BY r.purchase_order_number, r.po_item_number
+),
+inv AS (
+    SELECT
+        h.invoice_hk,
+        h.document_number,
+        h.company_code,
+        h.fiscal_year,
+        s.baseline_date AS inv_baseline_date,
+        s.net_due_days  AS inv_net_due_days,
+        CASE
+            WHEN s.baseline_date IS NOT NULL
+             AND s.net_due_days IS NOT NULL
+            THEN date_add('day', s.net_due_days, s.baseline_date)
+            ELSE NULL
+        END AS inv_due_date,
+        row_number() OVER (PARTITION BY h.invoice_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_invoice h
+    JOIN raw_vault.sat_invoice_rbkp s
+      ON h.invoice_hk = s.invoice_hk
+),
+inv_line_po AS (
+    SELECT
+        il.document_number,
+        il.company_code,
+        il.fiscal_year,
+        max(irs.purchase_order_number) AS po_num
+    FROM raw_vault.hub_invoice_line il
+    JOIN (
+        SELECT
+            invoice_line_hk,
+            purchase_order_number,
+            po_item_number,
+            row_number() OVER (
+                PARTITION BY invoice_line_hk
+                ORDER BY load_dts DESC
+            ) AS rn
+        FROM raw_vault.sat_invoice_line_rseg
+    ) irs
+      ON il.invoice_line_hk = irs.invoice_line_hk
+     AND irs.rn = 1
+    WHERE irs.purchase_order_number IS NOT NULL
+    GROUP BY il.document_number, il.company_code, il.fiscal_year
+),
+clr AS (
+    SELECT
+        clr_doc,
+        clr_bukrs,
+        clr_gjahr,
+        max(baseline_date) AS clr_baseline_date
+    FROM (
+        SELECT
+            ci.document_number AS clr_doc,
+            ci.company_code    AS clr_bukrs,
+            ci.fiscal_year     AS clr_gjahr,
+            s.baseline_date,
+            row_number() OVER (
+                PARTITION BY ci.cleared_item_hk
+                ORDER BY s.load_dts DESC
+            ) AS rn
+        FROM raw_vault.hub_cleared_item ci
+        JOIN raw_vault.sat_cleared_item_bsak s
+          ON ci.cleared_item_hk = s.cleared_item_hk
+    ) sub
+    WHERE rn = 1
+    GROUP BY clr_doc, clr_bukrs, clr_gjahr
+),
+inv_max_due AS (
+    SELECT
+        ilp.po_num AS purchase_order_number,
+        max(coalesce(i.inv_due_date, c.clr_baseline_date)) AS max_invoice_due_date
+    FROM (
+        SELECT * FROM inv WHERE rn = 1
+    ) i
+    LEFT JOIN inv_line_po ilp
+      ON ilp.document_number = i.document_number
+     AND ilp.company_code   = i.company_code
+     AND ilp.fiscal_year    = i.fiscal_year
+    LEFT JOIN clr c
+      ON c.clr_doc  = i.document_number
+     AND c.clr_bukrs = i.company_code
+     AND c.clr_gjahr = i.fiscal_year
+    WHERE ilp.po_num IS NOT NULL
+    GROUP BY ilp.po_num
+),
+pay_terms AS (
+    SELECT
+        hpt.payment_terms_code,
+        spt.days_gross_period,
+        row_number() OVER (
+            PARTITION BY hpt.payment_terms_hk
+            ORDER BY spt.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_payment_terms hpt
+    JOIN raw_vault.sat_payment_terms_t052 spt
+      ON hpt.payment_terms_hk = spt.payment_terms_hk
+    WHERE spt.end_dts IS NULL
+)
+SELECT
+    p.purchase_order_number,
+    p.po_item_number                      AS po_item,
+    p.po_amount,
+    coalesce(ph.vendor_id, v.vendor_id)   AS vendor_id,
+    coalesce(ph.company_code, p.company_code) AS company_code,
+    ph.po_date,
+    ph.created_on                         AS po_created_date,
+    ph.document_type                      AS po_doc_type,
+    ph.payment_terms_code                 AS po_payment_terms,
+    ph.purchasing_org,
+    ph.purchasing_group,
+    ph.currency                           AS po_currency,
+    ph.release_status                     AS po_release_status,
+    sc.item_delivery_date                 AS delivery_date,
+    sc.quantity_delivered,
+    sc.quantity_remaining,
+    greatest(
+        date_add(
+            'day',
+            coalesce(pt.days_gross_period, 30),
+            coalesce(sc.item_delivery_date, ph.po_date)
+        ),
+        coalesce(imd.max_invoice_due_date, DATE '1900-01-01')
+    ) AS po_due_date
+FROM po_sat p
+LEFT JOIN inv_vendor v
+  ON p.purchase_order_number = v.purchase_order_number
+ AND p.po_item_number       = v.po_item_number
+LEFT JOIN (
+    SELECT
+        h2.purchase_order_number,
+        s2.company_code,
+        s2.vendor_id,
+        s2.po_date,
+        s2.created_on,
+        s2.document_type,
+        s2.payment_terms_code,
+        s2.purchasing_org,
+        s2.purchasing_group,
+        s2.currency,
+        s2.release_status,
+        row_number() OVER (
+            PARTITION BY h2.po_hk
+            ORDER BY s2.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_purchase_order h2
+    JOIN raw_vault.sat_po_header_ekko s2
+      ON h2.po_hk = s2.po_hk
+) ph
+  ON ph.purchase_order_number = p.purchase_order_number
+ AND ph.rn = 1
+LEFT JOIN (
+    SELECT
+        h3.purchase_order_number,
+        h3.po_item_number,
+        e.item_delivery_date,
+        e.quantity_delivered,
+        e.quantity_remaining,
+        row_number() OVER (
+            PARTITION BY h3.po_line_hk
+            ORDER BY e.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_po_line h3
+    JOIN raw_vault.sat_po_schedule_eket e
+      ON h3.po_line_hk = e.po_line_hk
+) sc
+  ON sc.purchase_order_number = p.purchase_order_number
+ AND sc.po_item_number       = p.po_item_number
+ AND sc.rn = 1
+LEFT JOIN pay_terms pt
+  ON pt.payment_terms_code = ph.payment_terms_code
+ AND pt.rn = 1
+LEFT JOIN inv_max_due imd
+  ON imd.purchase_order_number = p.purchase_order_number
+WHERE p.rn = 1;
+7. dim_region
+sql
+
+
+CREATE TABLE procure2pay.dim_region AS
+WITH region_sat AS (
+    SELECT
+        s.region_hk,
+        s.country_code,
+        s.region_code,
+        s.region_name,
+        row_number() OVER (PARTITION BY s.region_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.sat_region_t005u s
+    WHERE s.end_dts IS NULL
+)
+SELECT
+    rs.country_code,
+    rs.region_code,
+    rs.region_name
+FROM region_sat rs
+WHERE rs.rn = 1;
+8. dim_vendor
+sql
+
+
+CREATE TABLE procure2pay.dim_vendor AS
+WITH vendor AS (
+    SELECT
+        h.vendor_id,
+        s.vendor_name_1,
+        s.vendor_name_2,
+        s.country_code,
+        s.city,
+        s.postal_code,
+        s.street,
+        s.region_code,
+        s.tax_number_1,
+        s.tax_number_2,
+        s.industry_sector,
+        s.vendor_account_group,
+        s.deletion_flag,
+        s.posting_block,
+        row_number() OVER (PARTITION BY h.vendor_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_vendor h
+    LEFT JOIN raw_vault.sat_vendor_lfa1 s
+      ON h.vendor_hk = s.vendor_hk
+)
+SELECT
+    vendor_id,
+    vendor_name_1 AS vendor_name,
+    vendor_name_2,
+    country_code,
+    city,
+    postal_code,
+    street,
+    region_code,
+    tax_number_1,
+    tax_number_2,
+    industry_sector,
+    vendor_account_group,
+    deletion_flag,
+    posting_block,
+    'SAP' AS system
+FROM vendor
+WHERE rn = 1;
+9. duplicate_payments_for_invoice
+sql
+
+
+CREATE TABLE procure2pay.duplicate_payments_for_invoice AS
+WITH cleared_current AS (
+    SELECT
+        ci.document_number,
+        ci.company_code,
+        ci.fiscal_year,
+        s.clearing_date,
+        s.amount_local_currency,
+        row_number() OVER (
+            PARTITION BY ci.cleared_item_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_cleared_item ci
+    JOIN raw_vault.sat_cleared_item_bsak s
+      ON ci.cleared_item_hk = s.cleared_item_hk
+    WHERE s.clearing_date IS NOT NULL
+      AND s.amount_local_currency IS NOT NULL
+),
+agg_by_inv_period AS (
+    SELECT
+        document_number,
+        company_code,
+        fiscal_year,
+        year(clearing_date) AS yr,
+        month(clearing_date) AS mo,
+        sum(amount_local_currency) AS tot_amt,
+        count(*) AS pay_cnt
+    FROM cleared_current
+    WHERE rn = 1
+    GROUP BY document_number, company_code, fiscal_year,
+             year(clearing_date), month(clearing_date)
+),
+dup AS (
+    SELECT
+        document_number AS invoice_number,
+        yr AS year,
+        mo AS month,
+        CASE WHEN pay_cnt > 1 THEN tot_amt ELSE 0 END AS dup_amt,
+        tot_amt AS total_amt
+    FROM agg_by_inv_period
+)
+SELECT
+    invoice_number,
+    year,
+    month,
+    sum(dup_amt)   AS duplicate_payment_amount,
+    sum(total_amt) AS total_payments,
+    CASE WHEN sum(total_amt) > 0
+         THEN cast(100.0 * sum(dup_amt) / sum(total_amt) AS decimal(11,8))
+         ELSE cast(0 AS decimal(11,8))
+    END AS duplicate_payment_rate
+FROM dup
+GROUP BY invoice_number, year, month;
+10. early_payment_candidates
+sql
+
+
+CREATE TABLE procure2pay.early_payment_candidates AS
+WITH latest AS (
+    SELECT *,
+           row_number() OVER (
+               PARTITION BY invoice_number, company_code, fiscal_year
+               ORDER BY sequence_nbr DESC
+           ) AS rn
+    FROM procure2pay.invoice_status_history
+),
+base AS (
+    SELECT
+        invoice_number AS document_number,
+        vendor_id,
+        invoice_amount_local,
+        due_date,
+        date_diff('day', current_date, due_date) AS days_until_due,
+        invoice_amount_local * 0.02  AS potential_discount_2pct,
+        invoice_amount_local * 0.015 AS potential_discount_1_5pct
+    FROM latest
+    WHERE rn = 1
+      AND status IN ('Open', 'Due')
+      AND date_diff('day', current_date, due_date) BETWEEN 10 AND 30
+),
+vendor_spend AS (
+    SELECT
+        vendor_id,
+        sum(invoice_amount_local) AS total_spend,
+        rank() OVER (ORDER BY sum(invoice_amount_local) DESC) AS spend_rank
+    FROM latest
+    WHERE upper(status) NOT IN ('CANCELLED', 'REJECTED')
+    GROUP BY vendor_id
+)
+SELECT
+    b.document_number,
+    b.vendor_id,
+    v.vendor_name,
+    b.invoice_amount_local,
+    b.due_date,
+    b.days_until_due,
+    b.potential_discount_2pct AS savings_if_2pct_discount,
+    CASE WHEN vs.spend_rank <= 10 THEN 'Strategic' ELSE 'Standard' END AS vendor_tier,
+    CASE
+        WHEN b.days_until_due <= 15 AND b.invoice_amount_local > 50000 THEN 'HIGH'
+        WHEN b.days_until_due <= 20 AND b.invoice_amount_local > 20000 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END AS early_pay_priority
+FROM base b
+LEFT JOIN procure2pay.dim_vendor v
+  ON b.vendor_id = v.vendor_id
+LEFT JOIN vendor_spend vs
+  ON b.vendor_id = vs.vendor_id
+ORDER BY early_pay_priority DESC, savings_if_2pct_discount DESC;
+11. fact_sap_po_level
+sql
+
+
+CREATE TABLE procure2pay.fact_sap_po_level AS
+WITH po AS (
+    SELECT
+        h.po_line_hk,
+        h.purchase_order_number,
+        h.po_item_number,
+        s.changed_on AS po_date_num,
+        s.quantity   AS ordered_qty,
+        s.net_value  AS po_amount,
+        row_number() OVER (PARTITION BY h.po_line_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_po_line h
+    JOIN raw_vault.sat_po_line_ekpo s
+      ON h.po_line_hk = s.po_line_hk
+),
+mseg_agg AS (
+    SELECT
+        m.purchase_order_number,
+        m.po_item_number,
+        year(mk.posting_date)  AS post_yr,
+        month(mk.posting_date) AS post_mo,
+        sum(m.quantity)        AS recv_qty
+    FROM raw_vault.hub_mat_doc_line hl
+    JOIN raw_vault.sat_mat_doc_line_mseg m
+      ON hl.mat_doc_line_hk = m.mat_doc_line_hk
+    JOIN raw_vault.hub_material_doc hd
+      ON hl.material_document_number = hd.material_document_number
+     AND hl.fiscal_year              = hd.fiscal_year
+     AND hl.client_id                = hd.client_id
+    JOIN (
+        SELECT
+            material_document_hk,
+            posting_date,
+            row_number() OVER (PARTITION BY material_document_hk ORDER BY load_dts DESC) AS rn
+        FROM raw_vault.sat_material_doc_mkpf
+    ) mk
+      ON hd.material_document_hk = mk.material_document_hk
+     AND mk.rn = 1
+    WHERE m.purchase_order_number IS NOT NULL
+      AND m.po_item_number IS NOT NULL
+      AND mk.posting_date IS NOT NULL
+    GROUP BY m.purchase_order_number, m.po_item_number,
+             year(mk.posting_date), month(mk.posting_date)
+),
+sched AS (
+    SELECT
+        h.purchase_order_number,
+        h.po_item_number,
+        max(e.item_delivery_date) AS del_date
+    FROM raw_vault.hub_po_line h
+    JOIN raw_vault.sat_po_schedule_eket e
+      ON h.po_line_hk = e.po_line_hk
+    WHERE e.item_delivery_date IS NOT NULL
+    GROUP BY h.purchase_order_number, h.po_item_number
+)
+SELECT
+    m.post_yr      AS posting_year,
+    m.post_mo      AS posting_month,
+    sc.del_date    AS delivery_date,
+    p.po_date_num  AS po_date,
+    m.recv_qty     AS received_qty,
+    p.ordered_qty  AS ordered_qty,
+    p.po_amount    AS po_amount
+FROM mseg_agg m
+LEFT JOIN po p
+  ON p.purchase_order_number = m.purchase_order_number
+ AND p.po_item_number        = m.po_item_number
+ AND p.rn = 1
+LEFT JOIN sched sc
+  ON sc.purchase_order_number = m.purchase_order_number
+ AND sc.po_item_number        = m.po_item_number;
+12. full_payment_rate
+sql
+
+
+CREATE TABLE procure2pay.full_payment_rate AS
+WITH inv_amt AS (
+    SELECT
+        h.document_number,
+        h.company_code,
+        h.fiscal_year,
+        s.inv_amount_local_currency,
+        row_number() OVER (PARTITION BY h.invoice_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_invoice h
+    JOIN raw_vault.sat_invoice_rbkp s
+      ON h.invoice_hk = s.invoice_hk
+    WHERE s.inv_amount_local_currency IS NOT NULL
+),
+clr_latest AS (
+    SELECT
+        ci.document_number,
+        ci.company_code,
+        ci.fiscal_year,
+        s.clearing_date,
+        s.amount_local_currency,
+        row_number() OVER (
+            PARTITION BY ci.cleared_item_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_cleared_item ci
+    JOIN raw_vault.sat_cleared_item_bsak s
+      ON ci.cleared_item_hk = s.cleared_item_hk
+    WHERE s.clearing_date IS NOT NULL
+      AND s.amount_local_currency IS NOT NULL
+),
+cleared_agg AS (
+    SELECT
+        document_number,
+        company_code,
+        fiscal_year,
+        year(clearing_date)  AS yr,
+        month(clearing_date) AS mo,
+        sum(amount_local_currency) AS tot_paid
+    FROM clr_latest
+    WHERE rn = 1
+    GROUP BY document_number, company_code, fiscal_year,
+             year(clearing_date), month(clearing_date)
+),
+full_paid AS (
+    SELECT
+        a.yr,
+        a.mo,
+        count(*) AS full_cnt
+    FROM cleared_agg a
+    JOIN inv_amt i
+      ON i.document_number = a.document_number
+     AND i.company_code    = a.company_code
+     AND i.fiscal_year     = a.fiscal_year
+     AND i.rn = 1
+    WHERE abs(a.tot_paid - i.inv_amount_local_currency)
+          <= (i.inv_amount_local_currency * 0.01)
+    GROUP BY a.yr, a.mo
+),
+tot_cleared AS (
+    SELECT
+        yr,
+        mo,
+        count(DISTINCT concat(
+            cast(document_number AS varchar), '-',
+            cast(company_code AS varchar), '-',
+            cast(fiscal_year AS varchar)
+        )) AS tot
+    FROM cleared_agg
+    GROUP BY yr, mo
+)
+SELECT
+    t.yr AS year,
+    t.mo AS month,
+    coalesce(f.full_cnt, 0) AS full_paid_invoices,
+    t.tot AS total_cleared_invoices,
+    CASE WHEN t.tot > 0
+         THEN cast(100.0 * coalesce(f.full_cnt, 0) / t.tot AS decimal(7,6))
+         ELSE cast(0 AS decimal(7,6))
+    END AS full_payment_rate_pct
+FROM tot_cleared t
+LEFT JOIN full_paid f
+  ON f.yr = t.yr AND f.mo = t.mo;
+13. gr_ir_aging
+sql
+
+
+CREATE TABLE procure2pay.gr_ir_aging AS
+WITH gr_data AS (
+    SELECT
+        m.purchase_order_number,
+        m.po_item_number,
+        year(mk.posting_date)  AS yr,
+        month(mk.posting_date) AS mo,
+        mk.posting_date,
+        sum(m.amount_local_currency) AS gr_amt
+    FROM raw_vault.hub_mat_doc_line hl
+    JOIN raw_vault.sat_mat_doc_line_mseg m
+      ON hl.mat_doc_line_hk = m.mat_doc_line_hk
+    JOIN raw_vault.hub_material_doc hd
+      ON hl.material_document_number = hd.material_document_number
+     AND hl.fiscal_year              = hd.fiscal_year
+     AND hl.client_id                = hd.client_id
+    JOIN (
+        SELECT
+            material_document_hk,
+            posting_date,
+            row_number() OVER (PARTITION BY material_document_hk ORDER BY load_dts DESC) AS rn
+        FROM raw_vault.sat_material_doc_mkpf
+    ) mk
+      ON hd.material_document_hk = mk.material_document_hk
+     AND mk.rn = 1
+    WHERE m.purchase_order_number IS NOT NULL
+      AND mk.posting_date IS NOT NULL
+      AND m.amount_local_currency IS NOT NULL
+    GROUP BY m.purchase_order_number, m.po_item_number,
+             year(mk.posting_date), month(mk.posting_date), mk.posting_date
+),
+ir_data AS (
+    SELECT
+        ir.purchase_order_number,
+        ir.po_item_number,
+        sum(ir.amount_doc_currency) AS ir_amt
+    FROM raw_vault.hub_invoice_line il
+    JOIN (
+        SELECT
+            invoice_line_hk,
+            purchase_order_number,
+            po_item_number,
+            amount_doc_currency,
+            row_number() OVER (PARTITION BY invoice_line_hk ORDER BY load_dts DESC) AS rn
+        FROM raw_vault.sat_invoice_line_rseg
+    ) ir
+      ON il.invoice_line_hk = ir.invoice_line_hk
+     AND ir.rn = 1
+    WHERE ir.purchase_order_number IS NOT NULL
+      AND ir.amount_doc_currency IS NOT NULL
+    GROUP BY ir.purchase_order_number, ir.po_item_number
+),
+grir AS (
+    SELECT
+        g.yr,
+        g.mo,
+        g.posting_date,
+        g.gr_amt - coalesce(i.ir_amt, 0) AS grir_balance,
+        date_diff('day', g.posting_date, current_date) AS age_days
+    FROM gr_data g
+    LEFT JOIN ir_data i
+      ON i.purchase_order_number = g.purchase_order_number
+     AND i.po_item_number        = g.po_item_number
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        sum(grir_balance)                                      AS total_bal,
+        sum(CASE WHEN age_days > 30 THEN grir_balance ELSE 0 END) AS over_30,
+        sum(CASE WHEN age_days > 60 THEN grir_balance ELSE 0 END) AS over_60,
+        sum(CASE WHEN age_days > 90 THEN grir_balance ELSE 0 END) AS over_90,
+        count_if(age_days > 30) AS cnt_30,
+        count_if(age_days > 60) AS cnt_60,
+        count_if(age_days > 90) AS cnt_90
+    FROM grir
+    GROUP BY yr, mo
+)
+SELECT
+    yr  AS year,
+    mo  AS month,
+    30  AS age_days,
+    total_bal AS total_grir_balance,
+    over_30   AS grir_over_30,
+    over_60   AS grir_over_60,
+    over_90   AS grir_over_90,
+    CASE WHEN total_bal > 0 THEN cast(100.0 * over_30 / total_bal AS decimal(8,8)) ELSE 0 END AS pct_grir_over_30,
+    CASE WHEN total_bal > 0 THEN cast(100.0 * over_60 / total_bal AS decimal(8,8)) ELSE 0 END AS pct_grir_over_60,
+    CASE WHEN total_bal > 0 THEN cast(100.0 * over_90 / total_bal AS decimal(8,8)) ELSE 0 END AS pct_grir_over_90,
+    cnt_30 AS cnt_grir_over_30,
+    cnt_60 AS cnt_grir_over_60,
+    cnt_90 AS cnt_grir_over_90
+FROM agg;
+14. gr_ir_outstanding_balance
+sql
+
+
+CREATE TABLE procure2pay.gr_ir_outstanding_balance AS
+WITH gr_data AS (
+    SELECT
+        m.purchase_order_number,
+        m.po_item_number,
+        year(mk.posting_date)  AS yr,
+        month(mk.posting_date) AS mo,
+        sum(m.amount_local_currency) AS gr_amt
+    FROM raw_vault.hub_mat_doc_line hl
+    JOIN raw_vault.sat_mat_doc_line_mseg m
+      ON hl.mat_doc_line_hk = m.mat_doc_line_hk
+    JOIN raw_vault.hub_material_doc hd
+      ON hl.material_document_number = hd.material_document_number
+     AND hl.fiscal_year              = hd.fiscal_year
+     AND hl.client_id                = hd.client_id
+    JOIN (
+        SELECT
+            material_document_hk,
+            posting_date,
+            row_number() OVER (PARTITION BY material_document_hk ORDER BY load_dts DESC) AS rn
+        FROM raw_vault.sat_material_doc_mkpf
+    ) mk
+      ON hd.material_document_hk = mk.material_document_hk
+     AND mk.rn = 1
+    WHERE m.purchase_order_number IS NOT NULL
+      AND m.po_item_number IS NOT NULL
+      AND mk.posting_date IS NOT NULL
+      AND m.amount_local_currency IS NOT NULL
+    GROUP BY m.purchase_order_number, m.po_item_number,
+             year(mk.posting_date), month(mk.posting_date)
+),
+ir_data AS (
+    SELECT
+        ir.purchase_order_number,
+        ir.po_item_number,
+        sum(ir.amount_doc_currency) AS ir_amt
+    FROM raw_vault.hub_invoice_line il
+    JOIN (
+        SELECT
+            invoice_line_hk,
+            purchase_order_number,
+            po_item_number,
+            amount_doc_currency,
+            row_number() OVER (PARTITION BY invoice_line_hk ORDER BY load_dts DESC) AS rn
+        FROM raw_vault.sat_invoice_line_rseg
+    ) ir
+      ON il.invoice_line_hk = ir.invoice_line_hk
+     AND ir.rn = 1
+    WHERE ir.purchase_order_number IS NOT NULL
+      AND ir.amount_doc_currency IS NOT NULL
+    GROUP BY ir.purchase_order_number, ir.po_item_number
+),
+grir AS (
+    SELECT
+        g.yr,
+        g.mo,
+        g.gr_amt - coalesce(i.ir_amt, 0) AS grir_balance
+    FROM gr_data g
+    LEFT JOIN ir_data i
+      ON i.purchase_order_number = g.purchase_order_number
+     AND i.po_item_number        = g.po_item_number
+    WHERE abs(g.gr_amt - coalesce(i.ir_amt, 0)) > 0.01
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        count(*) AS inv_cnt,
+        sum(abs(grir_balance)) AS total_bal
+    FROM grir
+    GROUP BY yr, mo
+),
+periods AS (
+    SELECT DISTINCT yr, mo FROM gr_data
+)
+SELECT
+    p.yr AS year,
+    p.mo AS month,
+    coalesce(a.inv_cnt, 0)   AS invoice_count,
+    coalesce(a.total_bal, 0) AS total_grir_blnc
+FROM periods p
+LEFT JOIN agg a
+  ON a.yr = p.yr AND a.mo = p.mo;
+15. invoice_status_history
+sql
+
+
+CREATE TABLE procure2pay.invoice_status_history AS
+WITH inv AS (
+    SELECT
+        h.invoice_hk,
+        h.document_number,
+        h.company_code,
+        h.fiscal_year,
+        s.posting_date,
+        s.document_date,
+        s.vendor_id,
+        s.currency_code,
+        s.inv_amount_local_currency,
+        s.payment_terms_code,
+        s.document_type,
+        s.baseline_date AS inv_baseline_date,
+        s.net_due_days  AS inv_net_due_days,
+        CASE
+            WHEN s.baseline_date IS NOT NULL
+             AND s.net_due_days IS NOT NULL
+            THEN date_add('day', s.net_due_days, s.baseline_date)
+            ELSE NULL
+        END AS inv_due_date,
+        row_number() OVER (PARTITION BY h.invoice_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_invoice h
+    JOIN raw_vault.sat_invoice_rbkp s
+      ON h.invoice_hk = s.invoice_hk
+),
+inv_line_po AS (
+    SELECT
+        il.document_number,
+        il.company_code,
+        il.fiscal_year,
+        max(irs.purchase_order_number) AS po_num,
+        max(irs.po_item_number)       AS po_item_num,
+        max(irs.plant)                AS plant_code,
+        max(irs.po_item_category)     AS po_item_category
+    FROM raw_vault.hub_invoice_line il
+    JOIN (
+        SELECT
+            invoice_line_hk,
+            purchase_order_number,
+            po_item_number,
+            plant,
+            po_item_category,
+            row_number() OVER (
+                PARTITION BY invoice_line_hk
+                ORDER BY load_dts DESC
+            ) AS rn
+        FROM raw_vault.sat_invoice_line_rseg
+    ) irs
+      ON il.invoice_line_hk = irs.invoice_line_hk
+     AND irs.rn = 1
+    WHERE irs.purchase_order_number IS NOT NULL
+    GROUP BY il.document_number, il.company_code, il.fiscal_year
+),
+po_amount AS (
+    SELECT
+        h.purchase_order_number,
+        h.po_item_number,
+        s.net_value AS po_amount
+    FROM raw_vault.hub_po_line h
+    JOIN (
+        SELECT
+            po_line_hk,
+            net_value,
+            row_number() OVER (PARTITION BY po_line_hk ORDER BY load_dts DESC) AS rn
+        FROM raw_vault.sat_po_line_ekpo
+    ) s
+      ON h.po_line_hk = s.po_line_hk
+     AND s.rn = 1
+    WHERE s.net_value IS NOT NULL
+),
+clr AS (
+    SELECT
+        clr_doc,
+        clr_bukrs,
+        clr_gjahr,
+        max(clearing_date)    AS clearing_date,
+        max(clearing_document) AS clearing_document,
+        max(baseline_date)    AS clr_baseline_date,
+        max(gl_account)       AS gl_account
+    FROM (
+        SELECT
+            ci.document_number AS clr_doc,
+            ci.company_code    AS clr_bukrs,
+            ci.fiscal_year     AS clr_gjahr,
+            s.clearing_date,
+            s.clearing_document,
+            s.baseline_date,
+            s.gl_account,
+            row_number() OVER (
+                PARTITION BY ci.cleared_item_hk
+                ORDER BY s.load_dts DESC
+            ) AS rn
+        FROM raw_vault.hub_cleared_item ci
+        JOIN raw_vault.sat_cleared_item_bsak s
+          ON ci.cleared_item_hk = s.cleared_item_hk
+    ) sub
+    WHERE rn = 1
+    GROUP BY clr_doc, clr_bukrs, clr_gjahr
+),
+terms AS (
+    SELECT
+        h.payment_terms_code,
+        max(t.days_1)           AS disc_days,
+        max(t.percentage_1)     AS disc_pct,
+        max(t.days_gross_period) AS net_days
+    FROM raw_vault.hub_payment_terms h
+    JOIN (
+        SELECT
+            payment_terms_hk,
+            days_1,
+            percentage_1,
+            days_gross_period,
+            row_number() OVER (
+                PARTITION BY payment_terms_hk
+                ORDER BY load_dts DESC
+            ) AS rn
+        FROM raw_vault.sat_payment_terms_t052
+    ) t
+      ON h.payment_terms_hk = t.payment_terms_hk
+     AND t.rn = 1
+    GROUP BY h.payment_terms_code
+),
+vendor_region AS (
+    SELECT
+        hv.vendor_id,
+        max(sv.region_code) AS region
+    FROM raw_vault.sat_vendor_lfa1 sv
+    JOIN raw_vault.hub_vendor hv
+      ON hv.vendor_hk = sv.vendor_hk
+    GROUP BY hv.vendor_id
+)
+SELECT
+    i.document_number AS invoice_number,
+    i.company_code,
+    ilp.plant_code,
+    i.fiscal_year,
+    sl.status,
+    sl.effective_date,
+    sl.sequence_number AS sequence_nbr,
+    sl.longtext        AS status_notes,
+    i.posting_date,
+    i.document_date,
+    i.vendor_id,
+    i.currency_code    AS currency,
+    i.inv_amount_local_currency AS invoice_amount_local,
+    i.payment_terms_code        AS payment_terms,
+    i.document_type,
+    CASE WHEN i.document_type IN ('RE', 'KR') THEN 'Y' ELSE 'N' END AS accrual_indicator,
+    coalesce(i.inv_due_date, c.clr_baseline_date) AS due_date,
+    i.document_date AS invoice_receipt_date,
+    c.gl_account,
+    coalesce(c.clr_baseline_date, i.inv_baseline_date) AS baseline_date,
+    c.clearing_date AS payment_date,
+    c.clearing_document,
+    CASE
+        WHEN c.clearing_date IS NULL
+             AND i.inv_due_date IS NOT NULL
+             AND i.inv_due_date < current_date
+            THEN date_diff('day', i.inv_due_date, current_date)
+        WHEN c.clearing_date IS NULL
+             AND i.inv_due_date IS NOT NULL
+             AND i.inv_due_date >= current_date
+            THEN 0
+        WHEN c.clearing_date IS NOT NULL
+             AND c.clr_baseline_date IS NOT NULL
+            THEN date_diff('day', c.clr_baseline_date, c.clearing_date)
+        ELSE 0
+    END AS aging_days,
+    ilp.po_num AS purchase_order_reference,
+    pa.po_amount,
+    CASE ilp.po_item_category
+        WHEN 0 THEN 'Goods'
+        WHEN 1 THEN 'Services'
+        WHEN 2 THEN 'Consumables'
+        WHEN 3 THEN 'Capital'
+        WHEN 4 THEN 'Subcontracting'
+        ELSE 'Goods'
+    END AS po_purpose,
+    t.disc_pct  AS discount_percent,
+    t.disc_days AS discount_days,
+    t.net_days  AS net_due_days,
+    vr.region,
+    'SAP' AS system
+FROM (SELECT * FROM inv WHERE rn = 1) i
+JOIN raw_vault.sat_invoice_status_log sl
+  ON i.invoice_hk = sl.invoice_hk
+LEFT JOIN inv_line_po ilp
+  ON ilp.document_number = i.document_number
+ AND ilp.company_code   = i.company_code
+ AND ilp.fiscal_year    = i.fiscal_year
+LEFT JOIN po_amount pa
+  ON pa.purchase_order_number = ilp.po_num
+ AND pa.po_item_number        = ilp.po_item_num
+LEFT JOIN clr c
+  ON c.clr_doc  = i.document_number
+ AND c.clr_bukrs = i.company_code
+ AND c.clr_gjahr = i.fiscal_year
+LEFT JOIN terms t
+  ON t.payment_terms_code = i.payment_terms_code
+LEFT JOIN vendor_region vr
+  ON vr.vendor_id = i.vendor_id
+WHERE sl.effective_date IS NOT NULL;
+16. late_accruals
+sql
+
+
+CREATE TABLE procure2pay.late_accruals AS
+WITH inv AS (
+    SELECT
+        h.invoice_hk,
+        s.posting_date,
+        s.document_date,
+        s.inv_amount_local_currency,
+        s.document_type,
+        row_number() OVER (PARTITION BY h.invoice_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_invoice h
+    JOIN raw_vault.sat_invoice_rbkp s
+      ON h.invoice_hk = s.invoice_hk
+    WHERE s.posting_date IS NOT NULL
+      AND s.document_date IS NOT NULL
+      AND s.inv_amount_local_currency IS NOT NULL
+),
+accruals AS (
+    SELECT
+        year(posting_date) AS yr,
+        month(posting_date) AS mo,
+        inv_amount_local_currency,
+        CASE WHEN date_diff('day', document_date, posting_date) > 30 THEN 1 ELSE 0 END AS is_late
+    FROM inv
+    WHERE rn = 1
+      AND document_type IN ('RE', 'KR')
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        sum(CASE WHEN is_late = 1 THEN inv_amount_local_currency ELSE 0 END) AS late_amt,
+        sum(CASE WHEN is_late = 1 THEN 1 ELSE 0 END) AS late_cnt,
+        sum(inv_amount_local_currency) AS tot_amt
+    FROM accruals
+    GROUP BY yr, mo
+)
+SELECT
+    yr AS year,
+    mo AS month,
+    late_amt AS late_accrual_amount,
+    late_cnt AS late_accrual_count,
+    tot_amt  AS total_accrual_amount,
+    CASE WHEN tot_amt > 0
+         THEN cast(100.0 * late_amt / tot_amt AS decimal(10,8))
+         ELSE cast(0 AS decimal(10,8))
+    END AS late_accrual_rate_pct
+FROM agg;
+17. late_payment_amount
+sql
+
+
+CREATE TABLE procure2pay.late_payment_amount AS
+WITH clr AS (
+    SELECT
+        s.clearing_date,
+        s.baseline_date,
+        s.amount_local_currency,
+        row_number() OVER (
+            PARTITION BY ci.cleared_item_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_cleared_item ci
+    JOIN raw_vault.sat_cleared_item_bsak s
+      ON ci.cleared_item_hk = s.cleared_item_hk
+    WHERE s.clearing_date IS NOT NULL
+      AND s.amount_local_currency IS NOT NULL
+),
+payments AS (
+    SELECT
+        year(clearing_date)  AS yr,
+        month(clearing_date) AS mo,
+        amount_local_currency,
+        CASE
+            WHEN baseline_date IS NOT NULL
+             AND clearing_date > baseline_date
+            THEN 1 ELSE 0
+        END AS is_late
+    FROM clr
+    WHERE rn = 1
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        sum(CASE WHEN is_late = 1 THEN amount_local_currency ELSE 0 END) AS late_amt,
+        sum(CASE WHEN is_late = 1 THEN 1 ELSE 0 END) AS late_cnt,
+        sum(amount_local_currency) AS tot_amt
+    FROM payments
+    GROUP BY yr, mo
+)
+SELECT
+    yr AS year,
+    mo AS month,
+    late_amt AS late_payment_amount,
+    late_cnt AS late_payment_count,
+    tot_amt  AS total_payment_amount,
+    CASE WHEN tot_amt > 0
+         THEN cast(100.0 * late_amt / tot_amt AS decimal(11,8))
+         ELSE cast(0 AS decimal(11,8))
+    END AS late_payment_rate_pct
+FROM agg;
+18. net_early_payment_benefit_benefit_index
+sql
+
+
+CREATE TABLE procure2pay.net_early_payment_benefit_index AS
+WITH spend AS (
+    SELECT coalesce(sum(inv_amount_local_currency), 0) AS tot
+    FROM (
+        SELECT
+            s.inv_amount_local_currency,
+            row_number() OVER (PARTITION BY h.invoice_hk ORDER BY s.load_dts DESC) AS rn
+        FROM raw_vault.hub_invoice h
+        JOIN raw_vault.sat_invoice_rbkp s
+          ON h.invoice_hk = s.invoice_hk
+        WHERE s.inv_amount_local_currency IS NOT NULL
+    ) x
+    WHERE rn = 1
+),
+early_pays AS (
+    SELECT
+        ci.document_number,
+        ci.company_code,
+        ci.fiscal_year,
+        s.clearing_date,
+        s.baseline_date,
+        s.amount_local_currency,
+        row_number() OVER (
+            PARTITION BY ci.cleared_item_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_cleared_item ci
+    JOIN raw_vault.sat_cleared_item_bsak s
+      ON ci.cleared_item_hk = s.cleared_item_hk
+    WHERE s.clearing_date IS NOT NULL
+      AND s.baseline_date IS NOT NULL
+      AND s.amount_local_currency IS NOT NULL
+),
+inv_terms AS (
+    SELECT
+        h.document_number,
+        h.company_code,
+        h.fiscal_year,
+        s.payment_terms_code,
+        row_number() OVER (PARTITION BY h.invoice_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_invoice h
+    JOIN raw_vault.sat_invoice_rbkp s
+      ON h.invoice_hk = s.invoice_hk
+    WHERE s.payment_terms_code IS NOT NULL
+),
+terms AS (
+    SELECT
+        h.payment_terms_code,
+        max(t.days_1)       AS disc_days,
+        max(t.percentage_1) AS disc_pct
+    FROM raw_vault.hub_payment_terms h
+    JOIN (
+        SELECT
+            payment_terms_hk,
+            days_1,
+            percentage_1,
+            row_number() OVER (PARTITION BY payment_terms_hk ORDER BY load_dts DESC) AS rn
+        FROM raw_vault.sat_payment_terms_t052
+        WHERE percentage_1 IS NOT NULL
+          AND percentage_1 > 0
+    ) t
+      ON h.payment_terms_hk = t.payment_terms_hk
+     AND t.rn = 1
+    GROUP BY h.payment_terms_code
+),
+benefits AS (
+    SELECT
+        ep.amount_local_currency,
+        date_diff('day', ep.clearing_date, ep.baseline_date) AS days_early,
+        t.disc_pct,
+        t.disc_days,
+        CASE
+            WHEN ep.clearing_date <= ep.baseline_date
+             AND ep.clearing_date <= date_add('day', -coalesce(t.disc_days, 0), ep.baseline_date)
+            THEN ep.amount_local_currency * (t.disc_pct / 100.0)
+            ELSE 0
+        END AS discount_benefit
+    FROM early_pays ep
+    JOIN inv_terms it
+      ON it.document_number = ep.document_number
+     AND it.company_code    = ep.company_code
+     AND it.fiscal_year     = ep.fiscal_year
+     AND it.rn = 1
+    JOIN terms t
+      ON t.payment_terms_code = it.payment_terms_code
+    WHERE ep.rn = 1
+      AND ep.clearing_date <= ep.baseline_date
+)
+SELECT
+    coalesce(sum(discount_benefit), 0)                       AS total_net_benefit,
+    (SELECT tot FROM spend)                                  AS total_spend,
+    CASE WHEN (SELECT tot FROM spend) > 0
+         THEN cast(100.0 * coalesce(sum(discount_benefit), 0)
+                   / (SELECT tot FROM spend) AS decimal(12,12))
+         ELSE cast(0 AS decimal(12,12))
+    END AS nepbi_percent
+FROM benefits;
+19. on_time_payment_rate
+sql
+
+
+CREATE TABLE procure2pay.on_time_payment_rate AS
+WITH clr AS (
+    SELECT
+        s.clearing_date,
+        s.baseline_date,
+        s.amount_local_currency,
+        row_number() OVER (
+            PARTITION BY ci.cleared_item_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_cleared_item ci
+    JOIN raw_vault.sat_cleared_item_bsak s
+      ON ci.cleared_item_hk = s.cleared_item_hk
+    WHERE s.clearing_date IS NOT NULL
+      AND s.amount_local_currency IS NOT NULL
+),
+by_period AS (
+    SELECT
+        year(clearing_date)  AS yr,
+        month(clearing_date) AS mo,
+        CASE
+            WHEN baseline_date IS NULL
+              OR clearing_date <= baseline_date
+            THEN 1 ELSE 0
+        END AS on_time,
+        1 AS tot
+    FROM clr
+    WHERE rn = 1
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        sum(on_time) AS on_time_cnt,
+        sum(tot)     AS total_cnt
+    FROM by_period
+    GROUP BY yr, mo
+)
+SELECT
+    yr AS year,
+    mo AS month,
+    on_time_cnt AS on_time_payments,
+    total_cnt   AS total_payments,
+    CASE WHEN total_cnt > 0
+         THEN cast(100.0 * on_time_cnt / total_cnt AS decimal(8,6))
+         ELSE cast(0 AS decimal(8,6))
+    END AS on_time_payment_rate_pct
+FROM agg;
+20. partial_payment_rate
+sql
+
+
+CREATE TABLE procure2pay.partial_payment_rate AS
+WITH inv_amt AS (
+    SELECT
+        h.document_number,
+        h.company_code,
+        h.fiscal_year,
+        s.inv_amount_local_currency,
+        row_number() OVER (PARTITION BY h.invoice_hk ORDER BY s.load_dts DESC) AS rn
+    FROM raw_vault.hub_invoice h
+    JOIN raw_vault.sat_invoice_rbkp s
+      ON h.invoice_hk = s.invoice_hk
+    WHERE s.inv_amount_local_currency IS NOT NULL
+),
+clr_latest AS (
+    SELECT
+        ci.document_number,
+        ci.company_code,
+        ci.fiscal_year,
+        s.clearing_date,
+        s.amount_local_currency,
+        row_number() OVER (
+            PARTITION BY ci.cleared_item_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_cleared_item ci
+    JOIN raw_vault.sat_cleared_item_bsak s
+      ON ci.cleared_item_hk = s.cleared_item_hk
+    WHERE s.clearing_date IS NOT NULL
+      AND s.amount_local_currency IS NOT NULL
+),
+cleared_agg AS (
+    SELECT
+        document_number,
+        company_code,
+        fiscal_year,
+        year(clearing_date)  AS yr,
+        month(clearing_date) AS mo,
+        sum(amount_local_currency) AS tot_paid
+    FROM clr_latest
+    WHERE rn = 1
+    GROUP BY document_number, company_code, fiscal_year,
+             year(clearing_date), month(clearing_date)
+),
+joined AS (
+    SELECT
+        a.yr,
+        a.mo,
+        CASE
+            WHEN a.tot_paid >  (i.inv_amount_local_currency * 0.01)
+             AND a.tot_paid <  (i.inv_amount_local_currency * 0.99)
+            THEN 1 ELSE 0
+        END AS partial,
+        1 AS inv_cnt
+    FROM cleared_agg a
+    JOIN inv_amt i
+      ON i.document_number = a.document_number
+     AND i.company_code    = a.company_code
+     AND i.fiscal_year     = a.fiscal_year
+     AND i.rn = 1
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        sum(partial) AS partial_cnt,
+        sum(inv_cnt) AS total_cnt
+    FROM joined
+    GROUP BY yr, mo
+)
+SELECT
+    yr AS year,
+    mo AS month,
+    partial_cnt AS partial_paid_invoices,
+    total_cnt   AS total_paid_invoices,
+    CASE WHEN total_cnt > 0
+         THEN cast(100.0 * partial_cnt / total_cnt AS decimal(8,6))
+         ELSE cast(0 AS decimal(8,6))
+    END AS partial_payment_rate_pct
+FROM agg;
+21. payment_predictability_index
+sql
+
+
+CREATE TABLE procure2pay.payment_predictability_index AS
+WITH clr AS (
+    SELECT
+        s.clearing_date,
+        s.document_date,
+        row_number() OVER (
+            PARTITION BY ci.cleared_item_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_cleared_item ci
+    JOIN raw_vault.sat_cleared_item_bsak s
+      ON ci.cleared_item_hk = s.cleared_item_hk
+    WHERE s.clearing_date IS NOT NULL
+      AND s.document_date  IS NOT NULL
+),
+cycle AS (
+    SELECT
+        year(clearing_date)  AS yr,
+        month(clearing_date) AS mo,
+        date_diff('day', document_date, clearing_date) AS cycle_days
+    FROM clr
+    WHERE rn = 1
+      AND clearing_date >= document_date
+),
+stats AS (
+    SELECT
+        yr,
+        mo,
+        avg(cycle_days)                  AS avg_days,
+        stddev_pop(cycle_days)           AS std_days,
+        count(*)                         AS n
+    FROM cycle
+    GROUP BY yr, mo
+)
+SELECT
+    yr AS posting_year,
+    mo AS posting_month,
+    CASE
+        WHEN avg_days > 0 AND std_days IS NOT NULL
+            THEN greatest(0.0, 1.0 - (std_days / avg_days))
+        ELSE NULL
+    END AS payment_predictability_index,
+    CASE
+        WHEN avg_days IS NULL OR avg_days = 0 THEN NULL
+        WHEN avg_days < 30 THEN 'Early'
+        WHEN avg_days <= 45 THEN 'On-Time'
+        ELSE 'Late'
+    END AS interpretation
+FROM stats;
+22. payment_processing_cycle_time
+sql
+
+
+CREATE TABLE procure2pay.payment_processing_cycle_time AS
+WITH clr AS (
+    SELECT
+        s.clearing_date,
+        s.document_date,
+        row_number() OVER (
+            PARTITION BY ci.cleared_item_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_cleared_item ci
+    JOIN raw_vault.sat_cleared_item_bsak s
+      ON ci.cleared_item_hk = s.cleared_item_hk
+    WHERE s.clearing_date IS NOT NULL
+      AND s.document_date  IS NOT NULL
+),
+cycle AS (
+    SELECT
+        year(clearing_date)  AS yr,
+        month(clearing_date) AS mo,
+        date_diff('day', document_date, clearing_date) AS cycle_days
+    FROM clr
+    WHERE rn = 1
+      AND clearing_date >= document_date
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        avg(cycle_days) AS avg_days,
+        min(cycle_days) AS min_days,
+        max(cycle_days) AS max_days,
+        count(*)        AS cleared_cnt
+    FROM cycle
+    GROUP BY yr, mo
+)
+SELECT
+    yr       AS year,
+    mo       AS month,
+    avg_days AS avg_payment_cycle_time_days,
+    min_days AS min_cycle_time_days,
+    max_days AS max_cycle_time_days,
+    cleared_cnt AS cleared_invoices
+FROM agg;
+23. payment_timing_recommendation
+sql
+
+
+CREATE TABLE procure2pay.payment_timing_recommendation AS
+WITH latest AS (
+    SELECT *,
+           row_number() OVER (
+               PARTITION BY invoice_number, company_code, fiscal_year
+               ORDER BY sequence_nbr DESC
+           ) AS rn
+    FROM procure2pay.invoice_status_history
+),
+latest_filtered AS (
+    SELECT *
+    FROM latest
+    WHERE rn = 1
+),
+obligations AS (
+    SELECT
+        status AS invoice_status,
+        date_diff('day', current_date, due_date) AS days_until_due,
+        sum(invoice_amount_local) AS amount,
+        count(*) AS invoice_count
+    FROM latest_filtered
+    WHERE status IN ('Open', 'Due', 'Overdue', 'Disputed')
+    GROUP BY 1, 2
+),
+early_benefit AS (
+    SELECT nepbi_percent, total_net_benefit
+    FROM procure2pay.net_early_payment_benefit_index
+),
+late_risk AS (
+    SELECT late_payment_rate_pct, late_payment_amount
+    FROM procure2pay.late_payment_amount
+    ORDER BY year DESC, month DESC
+    LIMIT 1
+),
+dpo_target AS (
+    SELECT weighted_dpo
+    FROM procure2pay.weighted_days_payable_outstanding
+    ORDER BY year DESC, month DESC
+    LIMIT 1
+)
+SELECT
+    'PAY_IMMEDIATELY' AS recommendation,
+    sum(CASE WHEN days_until_due < 0 THEN amount ELSE 0 END) AS amount,
+    sum(CASE WHEN days_until_due < 0 THEN invoice_count ELSE 0 END) AS invoice_count,
+    'Overdue - avoid penalties and relationship damage' AS rationale
+FROM obligations
+UNION ALL
+SELECT
+    'PAY_THIS_WEEK',
+    sum(CASE WHEN days_until_due BETWEEN 0 AND 7 THEN amount ELSE 0 END),
+    sum(CASE WHEN days_until_due BETWEEN 0 AND 7 THEN invoice_count ELSE 0 END),
+    'Due within 7 days - initiate payment to meet due date'
+FROM obligations
+UNION ALL
+SELECT
+    'EARLY_PAY_OPPORTUNITY',
+    sum(CASE WHEN days_until_due BETWEEN 8 AND 20 THEN amount ELSE 0 END),
+    sum(CASE WHEN days_until_due BETWEEN 8 AND 20 THEN invoice_count ELSE 0 END),
+    concat(
+        'Potential 2% discount; Current NEPBI: ',
+        cast(round((SELECT nepbi_percent FROM early_benefit), 2) AS varchar),
+        '%'
+    ) AS rationale
+FROM obligations
+UNION ALL
+SELECT
+    'HOLD_FOR_CASH',
+    sum(CASE WHEN days_until_due > 20 THEN amount ELSE 0 END),
+    sum(CASE WHEN days_until_due > 20 THEN invoice_count ELSE 0 END),
+    concat(
+        'Preserve cash; Target DPO: ',
+        cast(round((SELECT weighted_dpo FROM dpo_target), 0) AS varchar),
+        ' days'
+    ) AS rationale
+FROM obligations;
+24. supplier_delivery_accuracy_index
+sql
+
+
+CREATE TABLE procure2pay.supplier_delivery_accuracy_index AS
+WITH sched AS (
+    SELECT
+        h.purchase_order_number,
+        h.po_item_number,
+        max(e.item_delivery_date) AS del_date
+    FROM raw_vault.hub_po_line h
+    JOIN raw_vault.sat_po_schedule_eket e
+      ON h.po_line_hk = e.po_line_hk
+    WHERE e.item_delivery_date IS NOT NULL
+    GROUP BY h.purchase_order_number, h.po_item_number
+),
+gr AS (
+    SELECT
+        m.purchase_order_number,
+        m.po_item_number,
+        mk.posting_date,
+        year(mk.posting_date)  AS yr,
+        month(mk.posting_date) AS mo,
+        row_number() OVER (
+            PARTITION BY hl.mat_doc_line_hk
+            ORDER BY m.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_mat_doc_line hl
+    JOIN raw_vault.sat_mat_doc_line_mseg m
+      ON hl.mat_doc_line_hk = m.mat_doc_line_hk
+    JOIN raw_vault.hub_material_doc hd
+      ON hl.material_document_number = hd.material_document_number
+     AND hl.fiscal_year              = hd.fiscal_year
+     AND hl.client_id                = hd.client_id
+    JOIN (
+        SELECT
+            material_document_hk,
+            posting_date,
+            row_number() OVER (
+                PARTITION BY material_document_hk
+                ORDER BY load_dts DESC
+            ) AS rn2
+        FROM raw_vault.sat_material_doc_mkpf
+    ) mk
+      ON hd.material_document_hk = mk.material_document_hk
+     AND mk.rn2 = 1
+    WHERE m.purchase_order_number IS NOT NULL
+      AND m.po_item_number      IS NOT NULL
+      AND mk.posting_date       IS NOT NULL
+),
+joined AS (
+    SELECT
+        g.yr,
+        g.mo,
+        CASE
+            WHEN s.del_date IS NULL
+              OR g.posting_date <= s.del_date
+            THEN 1 ELSE 0
+        END AS on_time,
+        1 AS tot
+    FROM gr g
+    LEFT JOIN sched s
+      ON s.purchase_order_number = g.purchase_order_number
+     AND s.po_item_number        = g.po_item_number
+    WHERE g.rn = 1
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        sum(on_time) AS on_time_cnt,
+        sum(tot)     AS total_cnt
+    FROM joined
+    GROUP BY yr, mo
+)
+SELECT
+    yr AS year,
+    mo AS month,
+    on_time_cnt AS on_time_deliveries,
+    total_cnt   AS total_deliveries,
+    CASE WHEN total_cnt > 0
+         THEN cast(100.0 * on_time_cnt / total_cnt AS decimal(8,6))
+         ELSE cast(0 AS decimal(8,6))
+    END AS delivery_accuracy_pct
+FROM agg;
+25. weighted_days_payable_outstanding
+sql
+
+
+CREATE TABLE procure2pay.weighted_days_payable_outstanding AS
+WITH inv AS (
+    SELECT
+        s.posting_date,
+        s.inv_amount_local_currency,
+        row_number() OVER (
+            PARTITION BY h.invoice_hk
+            ORDER BY s.load_dts DESC
+        ) AS rn
+    FROM raw_vault.hub_invoice h
+    JOIN raw_vault.sat_invoice_rbkp s
+      ON h.invoice_hk = s.invoice_hk
+    WHERE s.posting_date IS NOT NULL
+      AND s.inv_amount_local_currency IS NOT NULL
+),
+by_period AS (
+    SELECT
+        year(posting_date)  AS yr,
+        month(posting_date) AS mo,
+        inv_amount_local_currency,
+        inv_amount_local_currency * 0.70 AS cogs_est
+    FROM inv
+    WHERE rn = 1
+),
+agg AS (
+    SELECT
+        yr,
+        mo,
+        sum(inv_amount_local_currency) AS tot_payables,
+        sum(cogs_est)                  AS tot_cogs
+    FROM by_period
+    GROUP BY yr, mo
+)
+SELECT
+    yr AS year,
+    mo AS month,
+    tot_payables AS total_payables,
+    tot_cogs     AS total_cogs,
+    CASE WHEN tot_cogs > 0
+         THEN cast((tot_payables / tot_cogs) * 30 AS decimal(10,8))
+         ELSE NULL
+    END AS weighted_dpo
+FROM agg;
+Remaining simple tables
+For the tables that don’t appear in the Snowflake script (genie_question_history, saved_insights, the temp tables), use the plain CREATE TABLE DDL I provided earlier; they’re just structural, with no Data Vault logic.
+
+If your raw vault database/schema names differ from raw_vault, or some column names differ slightly, adjust them globally—the transformation logic will still hold
