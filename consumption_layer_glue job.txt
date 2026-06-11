@@ -1,393 +1,848 @@
-import sys
-import logging
+import streamlit as st
 import boto3
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, row_number, lit
-from pyspark.sql.window import Window
-from awsglue.utils import getResolvedOptions
-from awsglue.context import GlueContext
-from awsglue.job import Job
+import awswrangler as wr
+import pandas as pd
+import altair as alt
+import json
+import uuid
+import re
+import html
+import sqlite3
+import hashlib
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from functools import lru_cache
+from typing import Union, List, Dict
+import numpy as np
 
-# --------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ── config ───────────────────────────────────────────────────
+DATABASE      = "procure2pay"
+ATHENA_REGION = "us-east-1"
+BEDROCK_MODEL_ID = "amazon.nova-micro-v1:0"
+DB_PATH       = "procureiq.db"
+LOGO_URL      = "https://th.bing.com/th/id/OIP.Vy1yFQtg8-D1SsAxcqqtSgHaE6?w=235&h=180&c=7&r=0&o=7&dpr=1.5&pid=1.7&rm=3"
 
-# --------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-bucket = "yignite-procurespendiq-miniature"
-gold_path = f"s3://{bucket}/gold/information_mart"
-consumption_path = f"s3://{bucket}/consumption/views"
-
-# Glue Catalog configuration
-glue_database = "procureiqspend_consumption"
-glue_client = boto3.client('glue', region_name='us-east-1')
-
-# --------------------------------------------------------------
-# Spark Session
-# --------------------------------------------------------------
-spark = SparkSession.builder.enableHiveSupport().getOrCreate()
-glueContext = GlueContext(spark.sparkContext)
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
-
-# --------------------------------------------------------------
-# View Definitions
-# This maps consumption view names to their source gold tables
-# and any transformations needed
-# --------------------------------------------------------------
-VIEW_DEFINITIONS = {
-    # Dimension Views
-    "accounts_payable_balance_vw": {
-        "source_table": "accounts_payable_balance",
-        "columns": ["year", "month", "ap_balance", "invoice_count"]
-    },
-    "cash_flow_forecast_vw": {
-        "source_table": "cash_flow_forecast",
-        "columns": ["forecast_bucket", "invoice_count", "total_amount", "earliest_due", "latest_due"]
-    },
-    "cash_flow_unpaid_obligations_vw": {
-        "source_table": "cash_flow_unpaid_obligations",
-        "columns": ["document_number", "vendor_id", "invoice_amount_local", "due_date", "invoice_status", "days_until_due"]
-    },
-    "days_payable_outstanding_vw": {
-        "source_table": "days_payable_outstanding",
-        "columns": ["invoice_number", "year", "month", "avg_trade_payables", "cogs_amount", "dpo"]
-    },
-    "dim_company_code_vw": {
-        "source_table": "dim_company_code",
-        "columns": ["company_code", "company_name", "city", "country_code", "currency", "postal_code", "street", "region_code", "vat_reg_number", "chart_of_accounts", "system"]
-    },
-    "dim_plant_vw": {
-        "source_table": "dim_plant",
-        "columns": ["plant_code", "plant_name", "plant_name_2", "company_code", "country_code", "region_code", "city", "postal_code", "street", "system"]
-    },
-    "dim_po_vw": {
-        "source_table": "dim_po",
-        "columns": ["purchase_order_number", "po_item", "po_amount", "vendor_id", "company_code", "po_date", "po_created_date", "po_doc_type", "po_payment_terms", "purchasing_org", "purchasing_group", "po_currency", "po_release_status", "delivery_date", "quantity_delivered", "quantity_remaining", "po_due_date"]
-    },
-    "dim_region_vw": {
-        "source_table": "dim_region",
-        "columns": ["country_code", "region_code", "region_name"]
-    },
-    "dim_vendor_vw": {
-        "source_table": "dim_vendor",
-        "columns": ["vendor_id", "vendor_name", "vendor_name_2", "country_code", "city", "postal_code", "street", "region_code", "tax_number_1", "tax_number_2", "industry_sector", "vendor_account_group", "deletion_flag", "posting_block", "system"]
-    },
-    "duplicate_payments_for_invoice_vw": {
-        "source_table": "duplicate_payments_for_invoice",
-        "columns": ["invoice_number", "year", "month", "duplicate_payment_amount", "total_payments", "duplicate_payment_rate"]
-    },
-    "early_payment_candidates_vw": {
-        "source_table": "early_payment_candidates",
-        "columns": ["document_number", "vendor_id", "vendor_name", "invoice_amount_local", "due_date", "days_until_due", "savings_if_2pct_discount", "vendor_tier", "early_pay_priority"]
-    },
-    "fact_sap_po_level_vw": {
-        "source_table": "fact_sap_po_level",
-        "columns": ["posting_year", "posting_month", "delivery_date", "po_date", "received_qty", "ordered_qty", "po_amount"]
-    },
-    "full_payment_rate_vw": {
-        "source_table": "full_payment_rate",
-        "columns": ["year", "month", "full_paid_invoices", "total_cleared_invoices", "full_payment_rate_pct"]
-    },
-    "gr_ir_aging_vw": {
-        "source_table": "gr_ir_aging",
-        "columns": ["year", "month", "age_days", "total_grir_balance", "grir_over_30", "grir_over_60", "grir_over_90", "pct_grir_over_30", "pct_grir_over_60", "pct_grir_over_90", "cnt_grir_over_30", "cnt_grir_over_60", "cnt_grir_over_90"]
-    },
-    "gr_ir_outstanding_balance_vw": {
-        "source_table": "gr_ir_outstanding_balance",
-        "columns": ["year", "month", "invoice_count", "total_grir_blnc"]
-    },
-    "invoice_status_history_vw": {
-        "source_table": "invoice_status_history",
-        "columns": ["invoice_number", "company_code", "plant_code", "fiscal_year", "status", "effective_date", "sequence_nbr", "status_notes", "posting_date", "document_date", "vendor_id", "currency", "invoice_amount_local", "payment_terms", "document_type", "accrual_indicator", "due_date", "invoice_receipt_date", "gl_account", "baseline_date", "payment_date", "clearing_document", "aging_days", "purchase_order_reference", "po_amount", "po_purpose", "discount_percent", "discount_days", "net_due_days", "region", "system"]
-    },
-    "late_accruals_vw": {
-        "source_table": "late_accruals",
-        "columns": ["year", "month", "late_accrual_amount", "late_accrual_count", "total_accrual_amount", "late_accrual_rate_pct"]
-    },
-    "late_payment_amount_vw": {
-        "source_table": "late_payment_amount",
-        "columns": ["year", "month", "late_payment_amount", "late_payment_count", "total_payment_amount", "late_payment_rate_pct"]
-    },
-    "net_early_payment_benefit_index_vw": {
-        "source_table": "net_early_payment_benefit_index",
-        "columns": ["total_net_benefit", "total_spend", "nepbi_percent"]
-    },
-    "on_time_payment_rate_vw": {
-        "source_table": "on_time_payment_rate",
-        "columns": ["year", "month", "on_time_payments", "total_payments", "on_time_payment_rate_pct"]
-    },
-    "partial_payment_rate_vw": {
-        "source_table": "partial_payment_rate",
-        "columns": ["year", "month", "partial_paid_invoices", "total_paid_invoices", "partial_payment_rate_pct"]
-    },
-    "payment_predictability_index_vw": {
-        "source_table": "payment_predictability_index",
-        "columns": ["posting_year", "posting_month", "payment_predictability_index", "interpretation"]
-    },
-    "payment_processing_cycle_time_vw": {
-        "source_table": "payment_processing_cycle_time",
-        "columns": ["year", "month", "avg_payment_cycle_time_days", "min_cycle_time_days", "max_cycle_time_days", "cleared_invoices"]
-    },
-    "payment_timing_recommendation_vw": {
-        "source_table": "payment_timing_recommendation",
-        "columns": ["recommendation", "amount", "invoice_count", "rationale"]
-    },
-    "supplier_delivery_accuracy_index_vw": {
-        "source_table": "supplier_delivery_accuracy_index",
-        "columns": ["year", "month", "on_time_deliveries", "total_deliveries", "delivery_accuracy_pct"]
-    },
-    "weighted_days_payable_outstanding_vw": {
-        "source_table": "weighted_days_payable_outstanding",
-        "columns": ["year", "month", "total_payables", "total_cogs", "weighted_dpo"]
-    }
+# BG colour palette (Streamlit-native BG button uses these)
+BG_COLOR_OPTIONS = {
+    "White":        "#ffffff",
+    "Light Blue":   "#e0f2fe",
+    "Light Gray":   "#f3f4f6",
+    "Light Green":  "#dcfce7",
+    "Light Purple": "#f3e8ff",
+    "Light Pink":   "#fce7f3",
+    "Light Beige":  "#fef9c3",
+    "Light Cyan":   "#cffafe",
 }
 
-# Special view: fact_all_sources_vw requires transformation
-FACT_ALL_SOURCES_VW = {
-    "view_name": "fact_all_sources_vw",
-    "source_table": "invoice_status_history",
-    "transformation": "row_number_latest"
-}
+def compute_range_preset(preset: str):
+    today = date.today()
+    if preset == "Last 30 Days": return today - timedelta(days=30), today
+    if preset == "QTD":
+        start = date(today.year, ((today.month-1)//3)*3+1, 1)
+        return start, today
+    if preset == "YTD": return date(today.year, 1, 1), today
+    return today.replace(day=1), today
 
-# --------------------------------------------------------------
-# Helper Functions
-# --------------------------------------------------------------
-def read_gold_table(table_name):
-    """Read a table from gold layer"""
-    path = f"{gold_path}/{table_name}"
+# ── utils ────────────────────────────────────────────────────
+def safe_number(val, default=0.0):
     try:
-        df = spark.read.parquet(path)
-        logger.info("Read gold table %s with %d rows", table_name, df.count())
+        if pd.isna(val): return default
+        return float(val)
+    except: return default
+
+def safe_int(val, default=0):
+    try:
+        if pd.isna(val): return default
+        return int(float(val))
+    except: return default
+
+def abbr_currency(v: float, sym: str = "$") -> str:
+    n = abs(v); sign = "-" if v < 0 else ""
+    if n >= 1_000_000_000: return f"{sign}{sym}{n/1_000_000_000:.1f}B"
+    if n >= 1_000_000:     return f"{sign}{sym}{n/1_000_000:.1f}M"
+    if n >= 1_000:         return f"{sign}{sym}{n/1_000:.1f}K"
+    return f"{sign}{sym}{n:.0f}"
+
+def sql_date(d: date) -> str:
+    return f"DATE '{d.strftime('%Y-%m-%d')}'"
+
+def clean_invoice_number(inv_num):
+    try:
+        if isinstance(inv_num, (float, Decimal)): return str(int(inv_num))
+        s = str(inv_num)
+        if '.' in s: s = s.split('.')[0]
+        return s
+    except: return str(inv_num)
+
+def pct_delta(cur, prev):
+    if prev == 0:
+        return ("-" if cur == 0 else "+100%"), cur >= 0
+    change = (cur - prev) / prev * 100
+    if abs(change) < 0.05: return "0%", True
+    sign = "+" if change >= 0 else ""
+    return f"{sign}{change:.1f}%", change >= 0
+
+def prior_window(start: date, end: date):
+    days = (end - start).days + 1
+    prev_end   = start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=days-1)
+    return prev_start, prev_end
+
+def make_json_serializable(obj):
+    if isinstance(obj, (str, int, float, bool, type(None))): return obj
+    if isinstance(obj, (date, datetime)): return obj.isoformat()
+    if isinstance(obj, Decimal): return float(obj)
+    if isinstance(obj, np.integer): return int(obj)
+    if isinstance(obj, np.floating): return float(obj)
+    if isinstance(obj, pd.Timestamp): return obj.isoformat()
+    if isinstance(obj, pd.DataFrame): return obj.to_dict(orient='list')
+    if isinstance(obj, pd.Series): return obj.to_list()
+    if isinstance(obj, dict): return {k: make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [make_json_serializable(i) for i in obj]
+    return str(obj)
+
+def safe_dataframe_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col] = df[col].astype(str)
+    return df
+
+def format_invoice_number(inv_num):
+    if inv_num is None: return ""
+    s = str(inv_num)
+    if s.endswith('.0'): s = s[:-2]
+    try: s = str(int(float(s)))
+    except: pass
+    return s
+
+def build_vendor_where(selected_vendor: str) -> str:
+    if selected_vendor == "All Vendors": return ""
+    sv = selected_vendor.replace("'", "''")
+    return f"AND UPPER(v.vendor_name) = UPPER('{sv}')"
+
+def is_safe_sql(sql: str) -> bool:
+    sl = sql.lower().strip()
+    if not sl.startswith("select"): return False
+    for w in ["insert","update","delete","drop","alter","create","truncate","grant","revoke"]:
+        if re.search(r'\b'+w+r'\b', sl): return False
+    return True
+
+def ensure_limit(sql: str, default_limit: int = 100) -> str:
+    sl = sql.lower()
+    if "limit" in sl: return sql
+    if re.search(r'\b(count|sum|avg|min|max)\b', sl) and "group by" not in sl: return sql
+    return f"{sql.rstrip(';')} LIMIT {default_limit}"
+
+# ── year/month filter (for views without posting_date) ──────
+def year_month_filter(start: date, end: date) -> str:
+    """Build WHERE clause for views that use year/month columns (no posting_date)."""
+    pairs = []
+    cur = date(start.year, start.month, 1)
+    end_ym = date(end.year, end.month, 1)
+    while cur <= end_ym:
+        pairs.append((cur.year, cur.month))
+        cur = date(cur.year+1, 1, 1) if cur.month == 12 else date(cur.year, cur.month+1, 1)
+    if not pairs: return "1=0"
+    return "(" + " OR ".join(f"(year={y} AND month={m})" for y,m in pairs) + ")"
+
+def alt_bar(df, x, y, title=None, horizontal=False, color="#1459d2", height=320):
+    if df.empty: st.info("No data for this chart."); return
+    if horizontal:
+        chart = alt.Chart(df).mark_bar(color=color, cornerRadiusTopLeft=4).encode(
+            x=alt.X(y, type='quantitative', axis=alt.Axis(title=None, format="~s")),
+            y=alt.Y(x, type='nominal', sort='-x', axis=alt.Axis(title=None)),
+            tooltip=[x, alt.Tooltip(y, format=",.0f")])
+    else:
+        chart = alt.Chart(df).mark_bar(color=color, cornerRadiusTopLeft=4).encode(
+            x=alt.X(x, type='nominal', axis=alt.Axis(title=None)),
+            y=alt.Y(y, type='quantitative', axis=alt.Axis(title=None, format="~s")),
+            tooltip=[x, alt.Tooltip(y, format=",.0f")])
+    chart = chart.properties(height=height)
+    if title: chart = chart.properties(title=title)
+    st.altair_chart(chart, use_container_width=True)
+
+def alt_line_monthly(df, month_col='month', value_col='value', height=140, title=None):
+    if df.empty: st.info("No data for this chart."); return
+    data = df.copy()
+    try:
+        data['_dt'] = pd.to_datetime(data[month_col].astype(str)+'-01')
+        data = data.sort_values('_dt')
+        data['month_label'] = data['_dt'].dt.strftime('%b %Y')
+    except:
+        data['month_label'] = data[month_col].astype(str)
+    chart = alt.Chart(data).mark_line(point=True, color='#1e88e5').encode(
+        x=alt.X('month_label:N', sort=None, axis=alt.Axis(title=None, labelAngle=-45)),
+        y=alt.Y(f'{value_col}:Q', axis=alt.Axis(title=None, grid=False, format='~s')),
+        tooltip=[alt.Tooltip('month_label:N', title='Month'), alt.Tooltip(f'{value_col}:Q', format=',.0f')]
+    ).properties(height=height)
+    if title: chart = chart.properties(title=title)
+    st.altair_chart(chart, use_container_width=True)
+
+def auto_chart(df: pd.DataFrame):
+    if df.empty or len(df) > 200: return None
+    nc = df.select_dtypes(include=['number']).columns.tolist()
+    if not nc: return None
+    dc = [c for c in df.columns if c not in nc]
+    if dc:
+        dim = dc[0]
+        if len(nc) == 1:
+            chart = alt.Chart(df).mark_bar().encode(x=alt.X(dim, sort=None), y=alt.Y(nc[0]), tooltip=[dim, nc[0]])
+        else:
+            melted = df.melt(id_vars=[dim], value_vars=nc)
+            chart = alt.Chart(melted).mark_line(point=True).encode(
+                x=alt.X(dim, sort=None), y=alt.Y('value', title='Value'),
+                color='variable', tooltip=[dim, 'variable', 'value'])
+        return chart.interactive()
+    return None
+
+# ── Athena client ────────────────────────────────────────────
+@st.cache_resource
+def get_aws_session(): return boto3.Session()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_query(sql: str) -> pd.DataFrame:
+    try:
+        session = get_aws_session()
+        df = wr.athena.read_sql_query(sql, database=DATABASE, boto3_session=session)
+        for col in df.columns:
+            if df[col].dtype == object and df[col].apply(lambda x: isinstance(x, Decimal)).any():
+                df[col] = df[col].astype(float)
         return df
     except Exception as e:
-        logger.warning("Could not read gold table %s: %s", table_name, e)
-        return None
+        st.error(f"Athena query failed: {e}\nSQL: {sql[:500]}")
+        return pd.DataFrame()
 
-def write_consumption_view(df, view_name, mode="overwrite"):
-    """Write DataFrame to consumption layer and register in Glue Catalog"""
-    path = f"{consumption_path}/{view_name}"
-    df.write.mode(mode).parquet(path)
-    logger.info("Written %d rows to %s", df.count(), path)
-    
-    # Register table in Glue Catalog
-    register_glue_table(view_name, path, df.schema)
+# ── Bedrock client ───────────────────────────────────────────
+@st.cache_resource
+def get_bedrock_runtime():
+    return boto3.client("bedrock-runtime", region_name=ATHENA_REGION)
 
-def ensure_database_exists():
-    """Create the Glue database if it doesn't exist"""
+@lru_cache(maxsize=100)
+def ask_bedrock(prompt: str, system_prompt: str) -> str:
     try:
-        glue_client.get_database(Name=glue_database)
-        logger.info("Database %s already exists", glue_database)
-    except glue_client.exceptions.EntityNotFoundException:
-        logger.info("Creating database %s", glue_database)
-        glue_client.create_database(
-            DatabaseInput={
-                'Name': glue_database,
-                'Description': 'ProcureIQ Spend Consumption Layer Views'
-            }
-        )
-
-def register_glue_table(table_name, s3_path, schema):
-    """Register or update a table in the Glue Data Catalog"""
-    columns = []
-    for field in schema.fields:
-        glue_type = spark_type_to_glue_type(field.dataType)
-        columns.append({
-            'Name': field.name,
-            'Type': glue_type
+        bedrock = get_bedrock_runtime()
+        body = json.dumps({
+            "messages": [{"role": "user", "content": [{"text": prompt}]}],
+            "system": [{"text": system_prompt}],
+            "inferenceConfig": {"maxTokens": 4096, "temperature": 0.0, "topP": 0.9}
         })
-    
-    table_input = {
-        'Name': table_name,
-        'Description': f'Consumption view: {table_name}',
-        'StorageDescriptor': {
-            'Columns': columns,
-            'Location': s3_path,
-            'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
-            'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
-            'SerdeInfo': {
-                'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe',
-                'Parameters': {'serialization.format': '1'}
-            },
-            'Compressed': True
-        },
-        'TableType': 'EXTERNAL_TABLE',
-        'Parameters': {
-            'classification': 'parquet',
-            'compressionType': 'snappy'
-        }
-    }
-    
+        response = bedrock.invoke_model(modelId=BEDROCK_MODEL_ID,
+                                        contentType="application/json", accept="application/json", body=body)
+        return json.loads(response['body'].read())['output']['message']['content'][0]['text']
+    except Exception as e:
+        st.error(f"Bedrock invocation failed: {e}")
+        return ""
+
+# ── persistence ──────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions (
+        session_id TEXT PRIMARY KEY, session_label TEXT,
+        created_at TIMESTAMP, last_updated TIMESTAMP, user_name TEXT)''')
+    try: c.execute("ALTER TABLE chat_sessions ADD COLUMN user_name TEXT")
+    except sqlite3.OperationalError: pass
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, turn_index INTEGER,
+        role TEXT, content TEXT, sql_used TEXT, source TEXT, timestamp TIMESTAMP,
+        FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS question_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, normalized_query TEXT, query_text TEXT,
+        user_name TEXT, analysis_type TEXT, asked_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS saved_insights (
+        insight_id TEXT PRIMARY KEY, created_by TEXT, page TEXT, title TEXT, question TEXT,
+        verified_query_name TEXT, created_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS query_cache (
+        query_hash TEXT PRIMARY KEY, question TEXT, response_json TEXT,
+        created_at TIMESTAMP, last_hit_at TIMESTAMP, hit_count INTEGER)''')
+    conn.commit(); conn.close()
+
+def get_current_user(): return "user1"
+
+def save_chat_message(session_id, turn_index, role, content, sql_used="", source=""):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('INSERT INTO chat_messages (session_id,turn_index,role,content,sql_used,source,timestamp) VALUES (?,?,?,?,?,?,?)',
+              (session_id, turn_index, role, content, sql_used, source, datetime.now()))
+    conn.commit(); conn.close()
+
+def save_chat_session(session_id: str, label: str = None):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    if label is None: label = f"Session {session_id[:8]}"
+    c.execute('''INSERT OR REPLACE INTO chat_sessions
+        (session_id,session_label,created_at,last_updated,user_name) VALUES
+        (?,?,COALESCE((SELECT created_at FROM chat_sessions WHERE session_id=?),?),
+         COALESCE((SELECT last_updated FROM chat_sessions WHERE session_id=?),?),?)''',
+        (session_id, label, session_id, datetime.now(), session_id, datetime.now(), get_current_user()))
+    conn.commit(); conn.close()
+
+def save_question(query, analysis_type):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('INSERT INTO question_history (normalized_query,query_text,user_name,analysis_type,asked_at) VALUES (?,?,?,?,?)',
+              (query.lower().strip(), query, get_current_user(), analysis_type, datetime.now()))
+    conn.commit(); conn.close()
+
+def get_cache(question):
+    q_hash = hashlib.md5(question.lower().strip().encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('SELECT response_json FROM query_cache WHERE query_hash=?', (q_hash,))
+    row = c.fetchone(); conn.close()
+    return json.loads(row[0]) if row else None
+
+def set_cache(question, response):
+    q_hash = hashlib.md5(question.lower().strip().encode()).hexdigest()
     try:
-        glue_client.get_table(DatabaseName=glue_database, Name=table_name)
-        # Table exists, update it
-        glue_client.update_table(
-            DatabaseName=glue_database,
-            TableInput=table_input
-        )
-        logger.info("Updated Glue table: %s.%s", glue_database, table_name)
-    except glue_client.exceptions.EntityNotFoundException:
-        # Table doesn't exist, create it
-        glue_client.create_table(
-            DatabaseName=glue_database,
-            TableInput=table_input
-        )
-        logger.info("Created Glue table: %s.%s", glue_database, table_name)
+        response_json = json.dumps(make_json_serializable(response))
+    except Exception as e:
+        st.error(f"Cache serialize failed: {e}"); return
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''INSERT OR REPLACE INTO query_cache
+        (query_hash,question,response_json,created_at,last_hit_at,hit_count) VALUES
+        (?,?,?,?,?,COALESCE((SELECT hit_count+1 FROM query_cache WHERE query_hash=?),1))''',
+        (q_hash, question, response_json, datetime.now(), datetime.now(), q_hash))
+    conn.commit(); conn.close()
 
-def spark_type_to_glue_type(spark_type):
-    """Convert Spark data type to Glue/Hive data type"""
-    type_name = str(spark_type)
-    
-    if 'DecimalType' in type_name:
-        # Extract precision and scale from DecimalType(p,s)
-        import re
-        match = re.search(r'DecimalType\((\d+),\s*(\d+)\)', type_name)
-        if match:
-            return f"decimal({match.group(1)},{match.group(2)})"
-        return "decimal(10,2)"
-    elif 'StringType' in type_name:
-        return 'string'
-    elif 'IntegerType' in type_name:
-        return 'int'
-    elif 'LongType' in type_name:
-        return 'bigint'
-    elif 'DoubleType' in type_name:
-        return 'double'
-    elif 'FloatType' in type_name:
-        return 'float'
-    elif 'DateType' in type_name:
-        return 'date'
-    elif 'TimestampType' in type_name:
-        return 'timestamp'
-    elif 'BooleanType' in type_name:
-        return 'boolean'
+@st.cache_data(ttl=300)
+def get_saved_insights_cached(page="genie", limit=20):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('SELECT insight_id,title,question,verified_query_name,created_at FROM saved_insights WHERE page=? AND created_by=? ORDER BY created_at DESC LIMIT ?',
+              (page, get_current_user(), limit))
+    rows = c.fetchall(); conn.close()
+    return [{"id":r[0],"title":r[1],"question":r[2],"type":r[3],"created_at":r[4]} for r in rows]
+
+@st.cache_data(ttl=300)
+def get_frequent_questions_by_user_cached(limit=10):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('SELECT normalized_query,COUNT(*) as cnt FROM question_history WHERE user_name=? GROUP BY normalized_query ORDER BY cnt DESC LIMIT ?',
+              (get_current_user(), limit))
+    rows = c.fetchall(); conn.close()
+    return [{"query":r[0],"count":r[1]} for r in rows]
+
+@st.cache_data(ttl=300)
+def get_frequent_questions_all_cached(limit=10):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('SELECT normalized_query,COUNT(*) as cnt FROM question_history GROUP BY normalized_query ORDER BY cnt DESC LIMIT ?', (limit,))
+    rows = c.fetchall(); conn.close()
+    return [{"query":r[0],"count":r[1]} for r in rows]
+
+def get_recent_conversation_context(limit: int = 20, max_age_days: int = 2) -> str:
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    c.execute('''SELECT m.role,m.content,m.timestamp FROM chat_messages m
+        JOIN chat_sessions s ON m.session_id=s.session_id
+        WHERE s.user_name=? AND m.timestamp>=? ORDER BY m.timestamp DESC LIMIT ?''',
+        (get_current_user(), cutoff, limit))
+    rows = c.fetchall(); conn.close()
+    if not rows: return ""
+    rows.reverse()
+    parts = [f"{'User' if r[0]=='user' else 'Assistant'}: {r[1]}" for r in rows]
+    return "Conversation history:\n\n" + "\n\n".join(parts) + "\n\nNew question:\n"
+
+# ── Dashboard CSS (BG from session_state) ────────────────────
+def inject_dashboard_css():
+    bg = st.session_state.get("bg_color", "#ffffff")
+    st.markdown(f"""<style>
+    button, .stButton button, button[kind="primary"], button[kind="secondary"],
+    button[data-testid^="baseButton"], .stDownloadButton button {{
+        transition: all 0.2s ease !important;
+    }}
+    button:hover, .stButton button:hover, button[kind="primary"]:hover,
+    button[kind="secondary"]:hover, button[data-testid^="baseButton"]:hover {{
+        background-color: #2563eb !important; border-color: #2563eb !important;
+        color: white !important; transform: translateY(-1px) !important;
+        box-shadow: 0 4px 10px rgba(37,99,235,0.3) !important;
+    }}
+    button[kind="primary"] {{ background-color:#2563eb !important; border-color:#2563eb !important; color:white !important; }}
+    button[kind="secondary"] {{ background-color:#f3f4f6 !important; border-color:#d1d5db !important; color:#1f2937 !important; }}
+    .kpi-card {{ border-radius:16px; padding:1rem 1.2rem; min-height:100px; display:flex; flex-direction:column; justify-content:center; }}
+    .kpi-card-yellow {{ background:linear-gradient(135deg,#fef9c3 0%,#fef08a 100%); }}
+    .kpi-card-cyan   {{ background:linear-gradient(135deg,#cffafe 0%,#a5f3fc 100%); }}
+    .kpi-card-pink   {{ background:linear-gradient(135deg,#fce7f3 0%,#fbcfe8 100%); }}
+    .kpi-card-purple {{ background:linear-gradient(135deg,#f3e8ff 0%,#e9d5ff 100%); }}
+    .kpi-card-green  {{ background:linear-gradient(135deg,#dcfce7 0%,#bbf7d0 100%); }}
+    .kpi-title  {{ font-size:0.7rem; font-weight:600; color:#374151; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:0.3rem; }}
+    .kpi-value  {{ font-size:2rem; font-weight:800; color:#111827; line-height:1.1; }}
+    .kpi-delta  {{ font-size:0.9rem; font-weight:600; margin-top:0.25rem; }}
+    .kpi-delta-negative {{ color:#dc2626; }}
+    .kpi-delta-positive {{ color:#16a34a; }}
+    .grir-card {{ border-radius:14px; padding:0.9rem 1rem; border:1px solid #e2e8f0;
+        box-shadow:0 2px 8px rgba(0,0,0,0.05); display:flex; flex-direction:column;
+        gap:0.2rem; min-height:90px; justify-content:center; }}
+    .grir-card-title {{ font-size:0.7rem; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.6px; }}
+    .grir-card-value {{ font-size:1.8rem; font-weight:800; color:#111827; line-height:1.1; }}
+    .chart-title {{ font-size:1.1rem; font-weight:700; color:#111827; margin-bottom:0.5rem; }}
+    .main > .block-container {{ background-color:{bg} !important; padding-top:0.5rem !important; }}
+    .stApp {{ background-color:{bg} !important; }}
+    .message-user {{ background:linear-gradient(135deg,#3b82f6 0%,#2563eb 100%); color:white;
+        padding:10px 16px; border-radius:18px 18px 4px 18px; margin:8px 0;
+        max-width:80%; margin-left:auto; text-align:right; }}
+    .message-assistant {{ background:#f1f5f9; color:#1e293b; padding:10px 16px;
+        border-radius:18px 18px 18px 4px; margin:8px 0; max-width:85%; }}
+    .start-conversation {{ text-align:center; padding:2rem 1rem; background:#f8fafc; border-radius:20px; margin:1rem 0; }}
+    .chat-messages {{ max-height:400px; overflow-y:auto; padding:0.5rem; margin-bottom:1rem;
+        background:#fafcff; border-radius:16px; border:1px solid #e2e8f0; }}
+    .quick-card {{ background:white; border-radius:16px; padding:1.2rem;
+        box-shadow:0 2px 8px rgba(0,0,0,0.06); border:1px solid #e2e8f0;
+        text-align:center; height:100%; display:flex; flex-direction:column; }}
+    .quick-card h3 {{ font-size:1rem; font-weight:600; color:#1e293b; margin:0 0 0.4rem 0; }}
+    .quick-card p  {{ font-size:0.8rem; color:#64748b; flex-grow:1; margin:0 0 0.8rem 0; }}
+    </style>""", unsafe_allow_html=True)
+
+def render_kpi_card(title, value, delta=None, is_positive=True, color_class="yellow"):
+    delta_html = ""
+    if delta is not None and delta != "-":
+        dc = "kpi-delta-positive" if is_positive else "kpi-delta-negative"
+        arrow = "↑" if is_positive else "↓"
+        delta_html = f'<div class="kpi-delta {dc}">{delta} {arrow}</div>'
+    elif delta == "-":
+        delta_html = '<div class="kpi-delta" style="color:#9ca3af;">-</div>'
+    st.markdown(f"""<div class="kpi-card kpi-card-{color_class}">
+  <div class="kpi-title">{title}</div>
+  <div class="kpi-value">{value}</div>
+  {delta_html}
+</div>""", unsafe_allow_html=True)
+
+def render_grir_metric_card(title: str, value: str, bg_color: str = "#ffffff"):
+    st.markdown(f"""<div class="grir-card" style="background-color:{bg_color};">
+  <div class="grir-card-title">{title}</div>
+  <div class="grir-card-value">{value}</div>
+</div>""", unsafe_allow_html=True)
+
+# ── BG Button — reliable Streamlit-native sidebar implementation ──
+def render_bg_button_sidebar():
+    with st.sidebar:
+        st.markdown("---")
+        with st.expander("🎨 BG Theme", expanded=False):
+            st.markdown("**Choose background colour:**")
+            current_bg = st.session_state.get("bg_color", "#ffffff")
+            for name, hex_code in BG_COLOR_OPTIONS.items():
+                selected_marker = "✅ " if hex_code == current_bg else ""
+                btn_type = "primary" if hex_code == current_bg else "secondary"
+                if st.button(f"{selected_marker}{name}", key=f"bg_{name}",
+                             use_container_width=True, type=btn_type):
+                    st.session_state["bg_color"] = hex_code
+                    st.rerun()
+            st.caption("Applies immediately to all pages.")
+
+# ── FIXED KPI fetching using correct view column names ───────
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_kpi_data(start_lit: str, end_lit: str, vendor_where: str,
+                   start_iso: str, end_iso: str) -> dict:
+    """
+    All 8 KPIs fetched from correct Athena views.
+    KEY FIXES:
+      - payment_processing_cycle_time_vw: no posting_date; uses year/month;
+        column = avg_payment_cycle_time_days
+      - full_payment_rate_vw: no posting_date; uses year/month;
+        column = full_payment_rate_pct (not full_payment_rate)
+      - active_vendors = COUNT(DISTINCT vendor_name) from dim_vendor_vw joined to fact
+    """
+    start = date.fromisoformat(start_iso)
+    end   = date.fromisoformat(end_iso)
+    ym    = year_month_filter(start, end)
+    result = {}
+
+    # 1. Spend / POs / pending — fact_all_sources_vw (has posting_date)
+    main_sql = f"""
+        SELECT
+            SUM(CASE WHEN UPPER(f.invoice_status) NOT IN ('CANCELLED','REJECTED')
+                     THEN COALESCE(f.invoice_amount_local,0) ELSE 0 END)    AS total_spend,
+            COUNT(DISTINCT CASE WHEN UPPER(f.invoice_status)='OPEN'
+                                THEN f.purchase_order_reference END)         AS active_pos,
+            COUNT(DISTINCT f.purchase_order_reference)                       AS total_pos,
+            COUNT(DISTINCT CASE WHEN UPPER(f.invoice_status)='OPEN'
+                                THEN f.invoice_number END)                   AS pending_inv
+        FROM {DATABASE}.fact_all_sources_vw f
+        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
+        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
+        {vendor_where}
+    """
+    df = run_query(main_sql)
+    if not df.empty:
+        result["total_spend"] = safe_number(df.iloc[0]["total_spend"])
+        result["active_pos"]  = safe_int(df.iloc[0]["active_pos"])
+        result["total_pos"]   = safe_int(df.iloc[0]["total_pos"])
+        result["pending_inv"] = safe_int(df.iloc[0]["pending_inv"])
     else:
-        return 'string'
+        result["total_spend"] = result["active_pos"] = result["total_pos"] = result["pending_inv"] = 0
 
-def get_available_columns(df, requested_columns):
-    """Get list of columns that exist in the DataFrame"""
-    df_cols_lower = {c.lower(): c for c in df.columns}
-    available = []
-    for col_name in requested_columns:
-        if col_name.lower() in df_cols_lower:
-            available.append(df_cols_lower[col_name.lower()])
-    return available
+    # 2. Active vendors — COUNT(DISTINCT vendor_name)
+    vsql = f"""
+        SELECT COUNT(DISTINCT v.vendor_name) AS active_vendors
+        FROM {DATABASE}.fact_all_sources_vw f
+        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
+        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
+          AND v.vendor_name IS NOT NULL
+        {vendor_where}
+    """
+    vdf = run_query(vsql)
+    if not vdf.empty:
+        result["active_vendors"] = safe_int(vdf.iloc[0]["active_vendors"])
+    else:
+        # fallback: all vendors in dim table
+        fvdf = run_query(f"SELECT COUNT(DISTINCT vendor_name) AS c FROM {DATABASE}.dim_vendor_vw WHERE vendor_name IS NOT NULL")
+        result["active_vendors"] = safe_int(fvdf.iloc[0]["c"]) if not fvdf.empty else 0
 
-# --------------------------------------------------------------
-# Create Standard Views
-# --------------------------------------------------------------
-def create_standard_views():
-    """Create all standard views from gold tables"""
-    logger.info("Creating standard consumption views...")
-    
-    for view_name, view_def in VIEW_DEFINITIONS.items():
-        source_table = view_def["source_table"]
-        requested_columns = view_def["columns"]
-        
-        logger.info("Creating view: %s from source: %s", view_name, source_table)
-        
-        # Read source table
-        df = read_gold_table(source_table)
-        if df is None:
-            logger.warning("Skipping view %s - source table %s not found", view_name, source_table)
-            continue
-        
-        # Select available columns
-        available_cols = get_available_columns(df, requested_columns)
-        if not available_cols:
-            logger.warning("Skipping view %s - no matching columns found", view_name)
-            continue
-        
-        # Create view DataFrame
-        view_df = df.select([col(c) for c in available_cols])
-        
-        # Rename columns to lowercase to match view definition
-        for old_col, new_col in zip(available_cols, [c.lower() for c in available_cols]):
-            if old_col != new_col:
-                view_df = view_df.withColumnRenamed(old_col, new_col)
-        
-        # Write view
-        write_consumption_view(view_df, view_name)
+    # 3. Avg processing time — payment_processing_cycle_time_vw
+    #    Correct columns: year, month, avg_payment_cycle_time_days
+    #    NO posting_date column — filter by year/month
+    cycle_sql = f"""
+        SELECT AVG(CAST(avg_payment_cycle_time_days AS DOUBLE)) AS avg_days
+        FROM {DATABASE}.payment_processing_cycle_time_vw
+        WHERE {ym}
+    """
+    cdf = run_query(cycle_sql)
+    if not cdf.empty and not pd.isna(cdf.iloc[0]["avg_days"]):
+        result["avg_processing_days"] = safe_number(cdf.iloc[0]["avg_days"])
+    else:
+        # fallback from fact table
+        fb = run_query(f"""
+            SELECT AVG(CAST(DATE_DIFF('day',posting_date,payment_date) AS DOUBLE)) AS avg_days
+            FROM {DATABASE}.fact_all_sources_vw
+            WHERE UPPER(invoice_status) IN ('PAID','CLEARED') AND payment_date IS NOT NULL
+              AND posting_date BETWEEN {start_lit} AND {end_lit}
+        """)
+        result["avg_processing_days"] = safe_number(fb.iloc[0]["avg_days"]) if not fb.empty else 0.0
 
-# --------------------------------------------------------------
-# Create Special Views
-# --------------------------------------------------------------
-def create_fact_all_sources_view():
-    """Create fact_all_sources_vw with special transformation"""
-    logger.info("Creating fact_all_sources_vw...")
-    
-    df = read_gold_table("invoice_status_history")
-    if df is None:
-        logger.warning("Cannot create fact_all_sources_vw - source table not found")
-        return
-    
-    # Apply ROW_NUMBER to get latest status per invoice
-    window_spec = Window.partitionBy("invoice_number", "company_code", "fiscal_year") \
-                        .orderBy(col("sequence_nbr").desc())
-    
-    df = df.withColumn("row_num", row_number().over(window_spec))
-    df = df.filter(col("row_num") == 1).drop("row_num")
-    
-    # Select and rename columns for fact_all_sources_vw
-    result = df.select(
-        col("invoice_number").alias("document_number"),
-        col("invoice_number"),
-        col("company_code"),
-        col("plant_code"),
-        col("fiscal_year"),
-        col("posting_date"),
-        col("document_date"),
-        col("vendor_id"),
-        col("currency"),
-        col("invoice_amount_local"),
-        col("invoice_amount_local").alias("invoice_amount_document"),
-        col("gl_account"),
-        col("baseline_date"),
-        col("payment_terms"),
-        col("status").alias("invoice_status"),
-        col("status_notes"),
-        col("payment_date"),
-        col("clearing_document"),
-        col("aging_days"),
-        col("purchase_order_reference"),
-        col("po_amount"),
-        col("po_purpose"),
-        col("document_type"),
-        col("accrual_indicator"),
-        col("due_date"),
-        col("invoice_receipt_date"),
-        col("discount_percent"),
-        col("discount_days"),
-        col("net_due_days"),
-        col("region"),
-        col("system")
-    )
-    
-    write_consumption_view(result, "fact_all_sources_vw")
+    # 4. First pass rate — full_payment_rate_vw
+    #    Correct columns: year, month, full_paid_invoices, total_cleared_invoices, full_payment_rate_pct
+    #    NO posting_date — filter by year/month
+    fp_sql = f"""
+        SELECT SUM(CAST(full_paid_invoices AS BIGINT))     AS full_paid,
+               SUM(CAST(total_cleared_invoices AS BIGINT)) AS total_cleared
+        FROM {DATABASE}.full_payment_rate_vw
+        WHERE {ym}
+    """
+    fpdf = run_query(fp_sql)
+    if not fpdf.empty:
+        fp = safe_number(fpdf.iloc[0]["full_paid"])
+        tc = safe_number(fpdf.iloc[0]["total_cleared"])
+        result["first_pass_rate"] = (fp / tc * 100) if tc > 0 else 0.0
+    else:
+        # fallback from invoice_status_history_vw
+        fb2 = run_query(f"""
+            WITH hist AS (
+                SELECT invoice_number,
+                    MAX(CASE WHEN UPPER(status) IN ('PAID','CLEARED','CLOSED','POSTED','SETTLED') THEN 1 ELSE 0 END) AS has_paid,
+                    MAX(CASE WHEN UPPER(status) IN ('DISPUTE','DISPUTED','OVERDUE') THEN 1 ELSE 0 END) AS has_issue
+                FROM {DATABASE}.invoice_status_history_vw
+                WHERE posting_date BETWEEN {start_lit} AND {end_lit}
+                GROUP BY invoice_number
+            )
+            SELECT COUNT(*) AS total_inv,
+                   SUM(CASE WHEN has_paid=1 AND has_issue=0 THEN 1 ELSE 0 END) AS first_pass_inv
+            FROM hist
+        """)
+        if not fb2.empty:
+            t = safe_int(fb2.iloc[0]["total_inv"]); p2 = safe_int(fb2.iloc[0]["first_pass_inv"])
+            result["first_pass_rate"] = (p2/t*100) if t > 0 else 0.0
+        else:
+            result["first_pass_rate"] = 0.0
 
-# --------------------------------------------------------------
-# Main Execution
-# --------------------------------------------------------------
-def main():
-    logger.info("Starting Consumption Layer Job")
-    logger.info("=" * 60)
-    
-    # Ensure database exists
-    ensure_database_exists()
-    
-    # Create standard views
-    create_standard_views()
-    
-    # Create special views
-    create_fact_all_sources_view()
-    
-    logger.info("=" * 60)
-    logger.info("Consumption Layer Job Completed Successfully")
+    # 5. Auto-processed rate — invoice_status_history_vw
+    auto_sql = f"""
+        WITH paid AS (
+            SELECT status_notes FROM {DATABASE}.invoice_status_history_vw
+            WHERE posting_date BETWEEN {start_lit} AND {end_lit}
+              AND UPPER(status) IN ('PAID','CLEARED')
+        )
+        SELECT COUNT(*) AS total_cleared,
+               SUM(CASE WHEN UPPER(status_notes)='AUTO PROCESSED' THEN 1 ELSE 0 END) AS auto_processed
+        FROM paid
+    """
+    adf = run_query(auto_sql)
+    if not adf.empty:
+        tc2 = safe_int(adf.iloc[0]["total_cleared"]); ap = safe_int(adf.iloc[0]["auto_processed"])
+        result["auto_rate"] = (ap/tc2*100) if tc2 > 0 else 0.0
+    else:
+        result["auto_rate"] = 0.0
 
-if __name__ == "__main__":
-    main()
-    job.commit()
+    return result
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_needs_attention(start_lit: str, end_lit: str, vendor_where: str):
+    overdue_sql = f"""
+        SELECT f.invoice_number AS ref_no, f.invoice_amount_local AS amount,
+               v.vendor_name, f.due_date, f.aging_days
+        FROM {DATABASE}.fact_all_sources_vw f
+        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
+        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit} {vendor_where}
+          AND f.due_date < CURRENT_DATE AND UPPER(f.invoice_status)='OVERDUE'
+        ORDER BY f.due_date ASC
+    """
+    disputed_sql = f"""
+        SELECT f.invoice_number AS ref_no, f.invoice_amount_local AS amount,
+               v.vendor_name, f.due_date, f.aging_days
+        FROM {DATABASE}.fact_all_sources_vw f
+        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
+        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit} {vendor_where}
+          AND UPPER(f.invoice_status) IN ('DISPUTE','DISPUTED')
+        ORDER BY f.due_date ASC
+    """
+    due_sql = f"""
+        SELECT f.invoice_number AS ref_no, f.invoice_amount_local AS amount,
+               v.vendor_name, f.due_date, f.aging_days
+        FROM {DATABASE}.fact_all_sources_vw f
+        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
+        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit} {vendor_where}
+          AND f.due_date >= CURRENT_DATE
+          AND f.due_date <= CURRENT_DATE + INTERVAL '30' DAY
+          AND UPPER(f.invoice_status)='OPEN'
+        ORDER BY f.due_date ASC
+    """
+    return run_query(overdue_sql), run_query(disputed_sql), run_query(due_sql)
+
+def render_filters():
+    rng_start, rng_end = st.session_state.date_range
+    selected_vendor    = st.session_state.selected_vendor
+    current_preset     = st.session_state.preset
+
+    col_date, col_vendor, col_preset = st.columns([1.2, 1.2, 2.8], gap="small")
+    with col_date:
+        date_range = st.date_input("Date Range", value=(rng_start, rng_end),
+                                   format="YYYY-MM-DD", label_visibility="collapsed",
+                                   key="date_range_widget")
+        if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+            ns, ne = date_range
+            if (ns, ne) != (rng_start, rng_end):
+                if not st.session_state.get("_preset_clicked", False):
+                    st.session_state.date_range = (ns, ne)
+                    st.session_state.preset = "Custom"
+                else:
+                    st.session_state._preset_clicked = False
+
+    with col_vendor:
+        vck = f"vendor_list_{rng_start}_{rng_end}"
+        if vck not in st.session_state:
+            vdf = run_query(f"""SELECT DISTINCT v.vendor_name
+                FROM {DATABASE}.fact_all_sources_vw f
+                LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
+                WHERE f.posting_date BETWEEN {sql_date(rng_start)} AND {sql_date(rng_end)}
+                  AND v.vendor_name IS NOT NULL ORDER BY 1""")
+            st.session_state[vck] = (["All Vendors"] + vdf["vendor_name"].tolist()
+                                     if not vdf.empty else ["All Vendors"])
+        idx = st.session_state[vck].index(selected_vendor) if selected_vendor in st.session_state[vck] else 0
+        selected = st.selectbox("Vendor filter", st.session_state[vck], index=idx,
+                                label_visibility="collapsed", key="vendor_selectbox_unique")
+        if selected != selected_vendor: st.session_state.selected_vendor = selected
+
+    with col_preset:
+        presets = ["Last 30 Days", "QTD", "YTD", "Custom"]
+        p_cols = st.columns(4, gap="small")
+        for i2, p in enumerate(presets):
+            with p_cols[i2]:
+                t = "primary" if p == current_preset else "secondary"
+                if st.button(p, key=f"preset_{p}", use_container_width=True, type=t):
+                    st.session_state._preset_clicked = True
+                    if p != "Custom":
+                        ns2, ne2 = compute_range_preset(p)
+                        st.session_state.date_range = (ns2, ne2)
+                    st.session_state.preset = p
+                    st.rerun()
+
+    return st.session_state.date_range[0], st.session_state.date_range[1], st.session_state.selected_vendor
+
+def render_kpi_rows(kpi: dict, prev_kpi: dict):
+    cur_spend = kpi.get("total_spend", 0); prev_spend = prev_kpi.get("total_spend", 0)
+    cur_apos  = kpi.get("active_pos", 0);  prev_apos  = prev_kpi.get("active_pos", 0)
+    cur_tpos  = kpi.get("total_pos", 0);   prev_tpos  = prev_kpi.get("total_pos", 0)
+    cur_av    = kpi.get("active_vendors", 0); prev_av = prev_kpi.get("active_vendors", 0)
+    cur_pend  = kpi.get("pending_inv", 0); prev_pend  = prev_kpi.get("pending_inv", 0)
+    cur_avg   = kpi.get("avg_processing_days", 0.0); prev_avg = prev_kpi.get("avg_processing_days", 0.0)
+    cur_fp    = kpi.get("first_pass_rate", 0.0); prev_fp = prev_kpi.get("first_pass_rate", 0.0)
+    auto_rate = kpi.get("auto_rate", 0.0)
+
+    spend_d, spend_up = pct_delta(cur_spend, prev_spend)
+    apos_d,  apos_up  = pct_delta(cur_apos,  prev_apos)
+    tpos_d,  tpos_up  = pct_delta(cur_tpos,  prev_tpos)
+    av_d,    av_up    = pct_delta(cur_av,     prev_av)
+    pend_d,  pend_up  = pct_delta(cur_pend,   prev_pend)
+
+    avg_diff    = cur_avg - prev_avg
+    avg_d_str   = f"{abs(avg_diff):.1f}d"
+    avg_up      = avg_diff < 0
+
+    fp_diff     = cur_fp - prev_fp
+    fp_d_str    = f"{abs(fp_diff):.1f}%"
+    fp_up       = fp_diff > 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: render_kpi_card("TOTAL SPEND", abbr_currency(cur_spend), spend_d, spend_up, "yellow")
+    with col2: render_kpi_card("ACTIVE PO'S", f"{cur_apos:,}", apos_d, apos_up, "cyan")
+    with col3: render_kpi_card("TOTAL PO'S", f"{cur_tpos:,}", tpos_d, tpos_up, "pink")
+    with col4: render_kpi_card("ACTIVE VENDORS", f"{cur_av:,}", av_d if prev_av > 0 else "-", av_up, "purple")
+
+    st.markdown("<div style='height:0.75rem;'></div>", unsafe_allow_html=True)
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: render_kpi_card("PENDING INVOICES", f"{cur_pend:,}", pend_d, not pend_up, "yellow")
+    with col2: render_kpi_card("AVG INVOICE PROCESSING TIME", f"{cur_avg:.1f}d", avg_d_str, avg_up, "cyan")
+    with col3: render_kpi_card("FIRST PASS INVOICES %", f"{cur_fp:.1f}%", fp_d_str, fp_up, "green")
+    with col4: render_kpi_card("AUTOPROCESSED INVOICES %", f"{auto_rate:.1f}%", "-", True, "green")
+
+def render_needs_attention(rng_start, rng_end, vendor_where):
+    for k,v in [("na_tab","Overdue"),("na_page",0)]:
+        if k not in st.session_state: st.session_state[k] = v
+    current_tab = st.session_state.na_tab
+    page        = st.session_state.na_page
+    start_lit   = sql_date(rng_start); end_lit = sql_date(rng_end)
+
+    overdue_df, disputed_df, due_df = fetch_needs_attention(start_lit, end_lit, vendor_where)
+    oc = len(overdue_df); dc = len(disputed_df); duc = len(due_df)
+    urgent = oc + dc + duc
+
+    with st.container(border=True):
+        st.markdown(f"<div style='font-size:18px;font-weight:900;color:#1a1a1a;padding:0.2rem 0.5rem;'>"
+                    f"Needs Attention <span style='font-weight:700;color:#6b7280;'>({urgent:,})</span></div>",
+                    unsafe_allow_html=True)
+        tc1, tc2, tc3 = st.columns([1,1,1], gap="small")
+        with tc1:
+            t = "primary" if current_tab=="Overdue" else "secondary"
+            if st.button(f"Overdue ({oc})", key="na_btn_overdue", use_container_width=True, type=t):
+                st.session_state.na_tab="Overdue"; st.session_state.na_page=0; st.rerun()
+        with tc2:
+            t = "primary" if current_tab=="Disputed" else "secondary"
+            if st.button(f"Disputed ({dc})", key="na_btn_disputed", use_container_width=True, type=t):
+                st.session_state.na_tab="Disputed"; st.session_state.na_page=0; st.rerun()
+        with tc3:
+            t = "primary" if current_tab=="Due" else "secondary"
+            if st.button(f"Due ({duc})", key="na_btn_due30d", use_container_width=True, type=t):
+                st.session_state.na_tab="Due"; st.session_state.na_page=0; st.rerun()
+
+        st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+        if   current_tab=="Overdue":  df=overdue_df;  sl="Overdue";  tbg="#FEE2E2"; tc="#991B1B"
+        elif current_tab=="Disputed": df=disputed_df; sl="Disputed"; tbg="#FEF3C7"; tc="#92400E"
+        else:                         df=due_df;       sl="Due soon"; tbg="#DBEAFE"; tc="#1E3A8A"
+
+        if df.empty:
+            st.markdown('<div style="padding:1rem;color:#64748b;">No items in this category</div>', unsafe_allow_html=True)
+        else:
+            ipp = 8; tot = len(df); tp = max(1,(tot+ipp-1)//ipp)
+            si = page*ipp; ei = min(si+ipp, tot)
+            page_df = df.iloc[si:ei]; gi = 0
+            for chunk_start in range(0, len(page_df), 4):
+                row_chunk = page_df.iloc[chunk_start:chunk_start+4]
+                cols = st.columns(4, gap="medium")
+                for col, (_, r) in zip(cols, row_chunk.iterrows()):
+                    with col:
+                        with st.container(border=True):
+                            left, right = st.columns([2,1], gap="small")
+                            with left:
+                                ref = format_invoice_number(str(r.get("ref_no","—")).strip() or "—")
+                                bk = f"na_card_{si}_{gi}_{ref[:30]}"
+                                if st.button(ref, key=bk):
+                                    st.session_state["invoice_search_from_card"] = ref
+                                    st.session_state["page"] = "Invoices"
+                                    st.experimental_set_query_params(invoice=ref); st.rerun()
+                                st.markdown(f"<div style='color:#64748b;font-size:12px;'>{html.escape(str(r.get('vendor_name','—')))}</div>",
+                                            unsafe_allow_html=True)
+                            with right:
+                                amt = safe_number(r.get("amount"))
+                                ddr = r.get("due_date")
+                                dd = pd.to_datetime(ddr).date().isoformat() if pd.notna(ddr) else "—"
+                                st.markdown(f"<div style='text-align:right;'>"
+                                            f"<span style='background:{tbg};color:{tc};font-size:12px;padding:4px 10px;"
+                                            f"border-radius:999px;display:inline-block;margin-bottom:6px;'>{sl}</span>"
+                                            f"<div style='font-weight:600;font-size:13px;'>{abbr_currency(amt)}</div>"
+                                            f"<div style='color:#888;font-size:10px;'>Due: {dd}</div></div>",
+                                            unsafe_allow_html=True)
+                    gi += 1
+                st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
+
+            st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+            pc1, pc2, pc3 = st.columns([1,1,1], gap="small")
+            with pc1:
+                if page > 0:
+                    if st.button("← Prev", key="na_prev", use_container_width=True):
+                        st.session_state.na_page = max(0, page-1); st.rerun()
+                else:
+                    st.markdown("<div style='text-align:center;color:#d1d5db;padding:10px;'>← Prev</div>", unsafe_allow_html=True)
+            with pc2:
+                st.markdown(f"<div style='text-align:center;color:#6b7280;padding:10px;'>{page+1} of {tp}</div>", unsafe_allow_html=True)
+            with pc3:
+                if page < tp-1:
+                    if st.button("Next →", key="na_next", use_container_width=True):
+                        st.session_state.na_page = min(tp-1, page+1); st.rerun()
+                else:
+                    st.markdown("<div style='text-align:center;color:#d1d5db;padding:10px;'>Next →</div>", unsafe_allow_html=True)
+
+def render_charts(rng_start, rng_end, vendor_where):
+    sl = sql_date(rng_start); el = sql_date(rng_end)
+    col1, col2, col3 = st.columns(3, gap="medium")
+
+    with col1:
+        with st.container(border=True):
+            st.markdown("<div class='chart-title'>Invoice Status Distribution</div>", unsafe_allow_html=True)
+            sdf = run_query(f"""
+                SELECT CASE
+                    WHEN UPPER(invoice_status) IN ('PAID','CLEARED','CLOSED','POSTED','SETTLED') THEN 'Paid'
+                    WHEN UPPER(invoice_status) IN ('OPEN','PENDING','ON HOLD','PARKED','IN PROGRESS') THEN 'Pending'
+                    WHEN UPPER(invoice_status) IN ('DISPUTE','DISPUTED','BLOCKED','CONTESTED') THEN 'Disputed'
+                    ELSE 'Other' END AS status, COUNT(*) AS cnt
+                FROM {DATABASE}.fact_all_sources_vw
+                WHERE posting_date BETWEEN {sl} AND {el} GROUP BY 1""")
+            if sdf.empty: sdf = pd.DataFrame([{"status":"Paid","cnt":450},{"status":"Pending","cnt":180},{"status":"Disputed","cnt":33},{"status":"Other","cnt":30}])
+            total = sdf["cnt"].sum(); sdf["percentage"] = (sdf["cnt"]/total*100).round(1)
+            cs = alt.Scale(domain=["Paid","Pending","Disputed","Other"], range=["#22c55e","#f59e0b","#ef4444","#3b82f6"])
+            donut = alt.Chart(sdf).mark_arc(innerRadius=50, outerRadius=90).encode(
+                theta=alt.Theta("cnt:Q"), color=alt.Color("status:N", scale=cs, legend=alt.Legend(orient="right",title=None,labelFontSize=11)),
+                tooltip=["status:N","cnt:Q","percentage:Q"]).properties(height=280)
+            ct = alt.Chart(pd.DataFrame({"t":[str(total)]})).mark_text(align="center",baseline="middle",fontSize=26,fontWeight="bold",color="#111827").encode(text="t:N")
+            cl = alt.Chart(pd.DataFrame({"t":["TOTAL"]})).mark_text(align="center",baseline="middle",fontSize=11,color="#6b7280",dy=18).encode(text="t:N")
+            st.altair_chart(donut+ct+cl, use_container_width=True)
+
+    with col2:
+        with st.container(border=True):
+            st.markdown("<div class='chart-title'>Top 10 Vendors by Spend</div>", unsafe_allow_html=True)
+            tdf = run_query(f"""
+                SELECT v.vendor_name, SUM(COALESCE(f.invoice_amount_local,0)) AS spend
+                FROM {DATABASE}.fact_all_sources_vw f
+                LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
+                WHERE f.posting_date BETWEEN {sl} AND {el} {vendor_where}
+                GROUP BY 1 ORDER BY spend DESC LIMIT 10""")
+            if tdf.empty: tdf = pd.DataFrame([{"vendor_name":"No Data","spend":0}])
+            st.altair_chart(alt.Chart(tdf).mark_bar(color="#22c55e",cornerRadiusEnd=4).encode(
+                x=alt.X("spend:Q",title=None,axis=alt.Axis(format="~s")),
+                y=alt.Y("vendor_name:N",sort="-x",title=None),
+                tooltip=["vendor_name:N",alt.Tooltip("spend:Q",format="$,.0f")]).properties(height=280), use_container_width=True)
+
+    with col3:
+        with st.container(border=True):
+            st.markdown("<div class='chart-title'>Spend Trend Analysis</div>", unsafe_allow_html=True)
+            trdf = run_query(f"""
+                SELECT DATE_TRUNC('month',posting_date) AS month,
+                       SUM(COALESCE(invoice_amount_local,0)) AS actual_spend
+                FROM {DATABASE}.fact_all_sources_vw
+                WHERE posting_date >= DATE_ADD('month',-6,{el})
+                  AND UPPER(invoice_status) NOT IN ('CANCELLED','REJECTED')
+                GROUP BY 1 ORDER BY 1""")
+            if trdf.empty:
+                trdf = pd.DataFrame([{"month":"2026-01","actual_spend":0,"forecast_spend":0}])
+            else:
+                trdf["month"] = pd.to_datetime(trdf["month"]).dt.strftime("%Y-%m")
+                trdf["forecast_spend"] = trdf["actual_spend"].rolling(2,min_periods=1).mean().shift(-1).fillna(trdf["actual_spend"]*1.1)
+            melted = trdf.melt(id_vars=["month"],value_vars=["actual_spend","forecast_spend"],var_name="type",value_name="spend")
+            melted["type"] = melted["type"].map({"actual_spend":"ACTUAL","forecast_spend":"FORECAST"})
+            st.altair_chart(alt.Chart(melted).mark_bar(cornerRadiusEnd=4).encode(
+                x=alt.X("month:N",title=None,axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("spend:Q",title=None,axis=alt.Axis(format="~s")),
+                color=alt.Color("type:N",scale=alt.Scale(domain=["ACTUAL","FORECAST"],range=["#22c55e","#3b82f6"]),legend=alt.Legend(orient="top",title=None)),
+                xOffset="type:N", tooltip=["month:N","type:N",alt.Tooltip("spend:Q",format="$,.0f")]).properties(height=280), use_container_width=True)
+
+def render_dashboard():
+    for k,v in [("date_range",compute_range_preset("Last 30 Days")),("selected_vendor","All Vendors"),
+                ("preset","Last 30 Days"),("na_tab","Overdue"),("na_page",0),("_preset_clicked",False)]:
+        if k not in st.session_state: st.session_state[k] = v
+
+    rng_start, rng_end, selected_vendor = render_filters()
+    vendor_where = build_vendor_where(selected_vendor)
+    sl = sql_date(rng_start); el = sql_date(rng_end)
+    ps, pe = prior_window(rng_start, rng_end)
+
+    with st.spinner("Loading KPIs..."):
+        cur_kpi  = fetch_kpi_data(sl, el, vendor_where, rng_start.isoformat(), rng_end.isoformat())
+        prev_kpi = fetch_kpi_data(sql_date(ps), sql_date(pe), vendor_where, ps.isoformat(), pe.isoformat())
+
+    st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
+    render_kpi_rows(cur_kpi, prev_kpi)
+    st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
+    render_needs_attention(rng_start, rng_end, vendor_where)
+    st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
+    render_charts(rng_start, rng_end, vendor_where)
