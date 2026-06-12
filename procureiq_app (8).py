@@ -1804,8 +1804,8 @@ def render_charts(rng_start, rng_end, vendor_where):
                                 )),
             )
             donut = base_chart.mark_arc(
-                innerRadius=36, outerRadius=56,
-                stroke="white", strokeWidth=1
+                innerRadius=42, outerRadius=62,
+                stroke="white", strokeWidth=2
             ).encode(tooltip=["legend_label:N", "cnt:Q", "percentage:Q"])
             ct = alt.Chart(pd.DataFrame({"t":[str(total)]})).mark_text(
                 align="center", baseline="middle",
@@ -3146,7 +3146,7 @@ div[data-testid="stForm"] button[data-testid="baseButton-primary"]:hover {
     with right_col:
         with st.container(border=True):
             # Header: title + action buttons
-            hc1, hc2, hc3, hc4, hc5 = st.columns([1.4, 0.75, 0.9, 0.9, 0.65], gap="large")
+            hc1, hc2, hc3, hc4, hc5 = st.columns([1.2, 0.78, 0.92, 0.95, 0.78], gap="large")
             with hc1:
                 st.markdown("<b style='font-size:1rem;color:#1e293b;'>AI Assistant</b>",
                             unsafe_allow_html=True)
