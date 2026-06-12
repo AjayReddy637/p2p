@@ -1359,9 +1359,11 @@ def render_kpi_rows(kpi: dict, prev_kpi: dict):
     st.markdown("<div style='height:0.75rem;'></div>", unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4)
     with col1: render_kpi_card("PENDING INVOICES", f"{cur_pend:,}", pend_d, not pend_up, "yellow")
-    with col2: render_kpi_card("AVG INVOICE PROCESSING TIME", f"{cur_avg:.1f}d", avg_d_str, avg_up, "cyan")
+    with col2: render_kpi_card("AVG PROCESSING TIME", f"{cur_avg:.1f}d", avg_d_str, avg_up, "cyan")
     with col3: render_kpi_card("FIRST PASS INVOICES %", f"{cur_fp:.1f}%", fp_d_str, fp_up, "green")
-    with col4: render_kpi_card("AUTOPROCESSED INVOICES %", f"{auto_rate:.1f}%", "-", True, "green")
+    # Show green +0.0% ↑ even when auto_rate is 0 (not a dash)
+    auto_delta = f"+{auto_rate:.1f}%"
+    with col4: render_kpi_card("AUTOPROCESSED INVOICES %", f"{auto_rate:.1f}%", auto_delta, True, "green")
 
 def render_needs_attention(rng_start, rng_end, vendor_where):
     for k, v in [("na_tab", "Overdue"), ("na_page", 0)]:
@@ -3615,8 +3617,9 @@ div[data-testid="stHorizontalBlock"]:first-of-type button[kind="primary"]:hover 
 .kpi-card-pink   {{ background:linear-gradient(135deg,#fce7f3 0%,#fbcfe8 100%); }}
 .kpi-card-purple {{ background:linear-gradient(135deg,#f3e8ff 0%,#e9d5ff 100%); }}
 .kpi-card-green  {{ background:linear-gradient(135deg,#dcfce7 0%,#bbf7d0 100%); }}
-.kpi-title {{ font-size:.7rem; font-weight:600; color:#374151; text-transform:uppercase;
-              letter-spacing:.5px; margin-bottom:.3rem; }}
+.kpi-title {{ font-size:.68rem; font-weight:600; color:#374151; text-transform:uppercase;
+              letter-spacing:.4px; margin-bottom:.3rem;
+              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .kpi-value {{ font-size:2rem; font-weight:800; color:#111827; line-height:1.1; }}
 .kpi-delta {{ font-size:.9rem; font-weight:600; margin-top:.25rem; }}
 .kpi-delta-negative {{ color:#dc2626; }}
