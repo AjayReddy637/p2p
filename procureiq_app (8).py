@@ -1783,7 +1783,7 @@ def render_charts(rng_start, rng_end, vendor_where):
             total = status_df["cnt"].sum()
             status_df["percentage"] = (status_df["cnt"] / total * 100).round(1) if total > 0 else 0.0
             status_df["pct_label"] = status_df["percentage"].apply(
-                lambda x: f"{x}%" if x >= 3.0 else ""
+                lambda x: f"{x}%" if x >= 4.0 else ""
             )
             cs = alt.Scale(domain=["Paid","Pending","Disputed","Other"],
                            range=["#22c55e","#f59e0b","#ef4444","#3b82f6"])
@@ -1796,22 +1796,23 @@ def render_charts(rng_start, rng_end, vendor_where):
                                 )),
             )
             donut = base_chart.mark_arc(
-                innerRadius=55, outerRadius=85, stroke="white", strokeWidth=2
+                innerRadius=45, outerRadius=75, stroke="white", strokeWidth=2
             ).encode(tooltip=["status:N","cnt:Q","percentage:Q"])
             pct_text = base_chart.mark_text(
-                radius=100, size=10, fontWeight="bold", color="#374151"
+                radius=90, size=10, fontWeight="bold", color="#374151"
             ).encode(text=alt.Text("pct_label:N"))
             ct = alt.Chart(pd.DataFrame({"t":[str(total)]})).mark_text(
                 align="center", baseline="middle",
-                fontSize=24, fontWeight="bold", color="#111827"
+                fontSize=22, fontWeight="bold", color="#111827"
             ).encode(text="t:N")
             cl = alt.Chart(pd.DataFrame({"t":["TOTAL"]})).mark_text(
                 align="center", baseline="middle",
-                fontSize=10, color="#6b7280", dy=16
+                fontSize=10, color="#6b7280", dy=14
             ).encode(text="t:N")
             st.altair_chart(
-                (donut + pct_text + ct + cl).properties(height=280),
-                use_container_width=True,
+                (donut + pct_text + ct + cl)
+                .properties(height=280, width=280),
+                use_container_width=False,
             )
 
     with col2:
