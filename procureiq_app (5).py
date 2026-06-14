@@ -37,11 +37,9 @@ BG_COLOR_OPTIONS = {
 def compute_range_preset(preset: str):
     today = date.today()
     if preset == "Last 30 Days": return today - timedelta(days=30), today
-    if preset == "QTD":
-        start = date(today.year, ((today.month-1)//3)*3+1, 1)
-        return start, today
-    if preset == "YTD": return date(today.year, 1, 1), today
-    return today.replace(day=1), today
+    if preset == "QTD":          return today - timedelta(days=120), today
+    if preset == "YTD":          return today - timedelta(days=365), today
+    return today - timedelta(days=30), today
 
 # ── utils ────────────────────────────────────────────────────
 def safe_number(val, default=0.0):
@@ -107,6 +105,58 @@ def safe_dataframe_display(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].astype(str)
     return df
 
+def render_simple_table(df: pd.DataFrame, col_labels: dict = None,
+                        striped: bool = True, max_rows: int = 500):
+    if df.empty:
+        st.caption("No data available.")
+        return
+
+    df = df.head(max_rows).copy()
+
+    headers = []
+    for col in df.columns:
+        label = col_labels.get(col, col.replace("_", " ").title()) if col_labels else col.replace("_", " ").title()
+        headers.append(f"<th style='padding:9px 12px;text-align:left;font-weight:600;"
+                       f"font-size:13px;color:#374151;background:#f8fafc;"
+                       f"border-bottom:2px solid #e2e8f0;white-space:nowrap;'>{label}</th>")
+
+    rows_html = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        bg = "#fafafa" if (striped and i % 2 == 0) else "white"
+        cells = []
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val) if not isinstance(val, str) else False:
+                display = "—"
+                align = "left"
+            elif isinstance(val, float):
+                display = f"{val:,.2f}" if val != int(val) else f"{int(val):,}"
+                align = "right"
+            elif isinstance(val, int):
+                display = f"{val:,}"
+                align = "right"
+            else:
+                display = str(val)
+                align = "left"
+            cells.append(
+                f"<td style='padding:8px 12px;font-size:13px;color:#1f2937;"
+                f"border-bottom:1px solid #f0f0f0;text-align:{align};"
+                f"background:{bg};'>{display}</td>"
+            )
+        rows_html.append(f"<tr>{''.join(cells)}</tr>")
+
+    table_html = f"""
+<div style='overflow-x:auto;border-radius:10px;border:1px solid #e2e8f0;
+            box-shadow:0 1px 4px rgba(0,0,0,0.05);margin:4px 0;'>
+<table style='width:100%;border-collapse:collapse;background:white;
+              font-family:inherit;'>
+<thead><tr>{''.join(headers)}</tr></thead>
+<tbody>{''.join(rows_html)}</tbody>
+</table>
+</div>"""
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
 def format_invoice_number(inv_num):
     if inv_num is None: return ""
     s = str(inv_num)
@@ -133,9 +183,7 @@ def ensure_limit(sql: str, default_limit: int = 100) -> str:
     if re.search(r'\b(count|sum|avg|min|max)\b', sl) and "group by" not in sl: return sql
     return f"{sql.rstrip(';')} LIMIT {default_limit}"
 
-# ── year/month filter (for views without posting_date) ──────
 def year_month_filter(start: date, end: date) -> str:
-    """Build WHERE clause for views that use year/month columns (no posting_date)."""
     pairs = []
     cur = date(start.year, start.month, 1)
     end_ym = date(end.year, end.month, 1)
@@ -199,7 +247,7 @@ def auto_chart(df: pd.DataFrame):
 @st.cache_resource
 def get_aws_session(): return boto3.Session()
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def run_query(sql: str) -> pd.DataFrame:
     try:
         session = get_aws_session()
@@ -236,27 +284,295 @@ def ask_bedrock(prompt: str, system_prompt: str) -> str:
 # ── persistence ──────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+
     c.execute('''CREATE TABLE IF NOT EXISTS chat_sessions (
-        session_id TEXT PRIMARY KEY, session_label TEXT,
-        created_at TIMESTAMP, last_updated TIMESTAMP, user_name TEXT)''')
+        session_id    TEXT PRIMARY KEY,
+        session_label TEXT,
+        created_at    TIMESTAMP,
+        last_updated  TIMESTAMP,
+        user_name     TEXT,
+        page_context  TEXT DEFAULT 'Dashboard')''')
     try: c.execute("ALTER TABLE chat_sessions ADD COLUMN user_name TEXT")
     except sqlite3.OperationalError: pass
+    try: c.execute("ALTER TABLE chat_sessions ADD COLUMN page_context TEXT DEFAULT 'Dashboard'")
+    except sqlite3.OperationalError: pass
+
     c.execute('''CREATE TABLE IF NOT EXISTS chat_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, turn_index INTEGER,
-        role TEXT, content TEXT, sql_used TEXT, source TEXT, timestamp TIMESTAMP,
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT,
+        turn_index  INTEGER,
+        role        TEXT,
+        content     TEXT,
+        sql_used    TEXT,
+        source      TEXT,
+        timestamp   TIMESTAMP,
         FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id))''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS user_memory (
+        memory_id   TEXT PRIMARY KEY,
+        user_name   TEXT NOT NULL,
+        memory_type TEXT NOT NULL,
+        memory_key  TEXT NOT NULL,
+        memory_val  TEXT NOT NULL,
+        source      TEXT,
+        confidence  REAL DEFAULT 1.0,
+        created_at  TIMESTAMP,
+        updated_at  TIMESTAMP,
+        access_count INTEGER DEFAULT 0)''')
+    try: c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_memory ON user_memory(user_name, memory_key)")
+    except sqlite3.OperationalError: pass
+
     c.execute('''CREATE TABLE IF NOT EXISTS question_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, normalized_query TEXT, query_text TEXT,
-        user_name TEXT, analysis_type TEXT, asked_at TIMESTAMP)''')
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        normalized_query TEXT,
+        query_text       TEXT,
+        user_name        TEXT,
+        analysis_type    TEXT,
+        result_layout    TEXT,
+        asked_at         TIMESTAMP)''')
+    try: c.execute("ALTER TABLE question_history ADD COLUMN result_layout TEXT")
+    except sqlite3.OperationalError: pass
+
     c.execute('''CREATE TABLE IF NOT EXISTS saved_insights (
-        insight_id TEXT PRIMARY KEY, created_by TEXT, page TEXT, title TEXT, question TEXT,
-        verified_query_name TEXT, created_at TIMESTAMP)''')
+        insight_id          TEXT PRIMARY KEY,
+        created_by          TEXT,
+        page                TEXT,
+        title               TEXT,
+        question            TEXT,
+        verified_query_name TEXT,
+        created_at          TIMESTAMP)''')
+
     c.execute('''CREATE TABLE IF NOT EXISTS query_cache (
-        query_hash TEXT PRIMARY KEY, question TEXT, response_json TEXT,
-        created_at TIMESTAMP, last_hit_at TIMESTAMP, hit_count INTEGER)''')
+        query_hash   TEXT PRIMARY KEY,
+        question     TEXT,
+        response_json TEXT,
+        created_at   TIMESTAMP,
+        last_hit_at  TIMESTAMP,
+        hit_count    INTEGER DEFAULT 0,
+        ttl_seconds  INTEGER DEFAULT 3600,
+        cache_type   TEXT DEFAULT "genie"
+    )''')
+    try: c.execute("ALTER TABLE query_cache ADD COLUMN ttl_seconds INTEGER DEFAULT 3600")
+    except sqlite3.OperationalError: pass
+    try: c.execute("ALTER TABLE query_cache ADD COLUMN cache_type TEXT DEFAULT 'genie'")
+    except sqlite3.OperationalError: pass
+
+    c.execute('''CREATE TABLE IF NOT EXISTS kpi_snapshot_cache (
+        snapshot_id  TEXT PRIMARY KEY,
+        user_name    TEXT,
+        preset       TEXT,
+        start_date   TEXT,
+        end_date     TEXT,
+        kpi_json     TEXT,
+        created_at   TIMESTAMP
+    )''')
+
     conn.commit(); conn.close()
 
 def get_current_user(): return "user1"
+
+def get_short_term_context(session_id: str, max_turns: int = 10) -> list:
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''SELECT role, content, timestamp
+                 FROM chat_messages
+                 WHERE session_id = ?
+                 ORDER BY turn_index DESC, timestamp DESC
+                 LIMIT ?''', (session_id, max_turns * 2))
+    rows = c.fetchall(); conn.close()
+    rows.reverse()
+    return [{"role": r[0], "content": r[1], "timestamp": r[2]} for r in rows]
+
+
+def build_bedrock_context(session_id: str, max_turns: int = 6) -> str:
+    msgs = get_short_term_context(session_id, max_turns)
+    if not msgs:
+        return ""
+    parts = []
+    for m in msgs:
+        label = "User" if m["role"] == "user" else "Assistant"
+        text = m["content"][:600] + "…" if len(m["content"]) > 600 else m["content"]
+        parts.append(f"{label}: {text}")
+    return (
+        "Previous conversation context (use this to answer follow-up questions):\n\n"
+        + "\n\n".join(parts)
+        + "\n\n---\nNew question:\n"
+    )
+
+
+def set_user_memory(key: str, value: str,
+                    memory_type: str = "preference",
+                    source: str = "explicit",
+                    confidence: float = 1.0):
+    import uuid as _uuid
+    user = get_current_user()
+    mid  = hashlib.md5(f"{user}:{key}".encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''INSERT INTO user_memory
+                    (memory_id, user_name, memory_type, memory_key, memory_val,
+                     source, confidence, created_at, updated_at, access_count)
+                 VALUES (?,?,?,?,?,?,?,?,?,0)
+                 ON CONFLICT(memory_id) DO UPDATE SET
+                    memory_val   = excluded.memory_val,
+                    memory_type  = excluded.memory_type,
+                    source       = excluded.source,
+                    confidence   = excluded.confidence,
+                    updated_at   = excluded.updated_at''',
+              (mid, user, memory_type, key, value, source, confidence,
+               datetime.now(), datetime.now()))
+    conn.commit(); conn.close()
+
+
+def get_user_memory(key: str, default=None):
+    user = get_current_user()
+    mid  = hashlib.md5(f"{user}:{key}".encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('SELECT memory_val, access_count FROM user_memory WHERE memory_id=?', (mid,))
+    row = c.fetchone()
+    if row:
+        c.execute('UPDATE user_memory SET access_count=? WHERE memory_id=?',
+                  (row[1]+1, mid))
+        conn.commit()
+    conn.close()
+    return row[0] if row else default
+
+
+def get_all_user_memories(memory_type: str = None) -> list:
+    user = get_current_user()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    if memory_type:
+        c.execute('''SELECT memory_key, memory_val, memory_type, source, confidence, updated_at
+                     FROM user_memory WHERE user_name=? AND memory_type=?
+                     ORDER BY access_count DESC''', (user, memory_type))
+    else:
+        c.execute('''SELECT memory_key, memory_val, memory_type, source, confidence, updated_at
+                     FROM user_memory WHERE user_name=?
+                     ORDER BY memory_type, access_count DESC''', (user,))
+    rows = c.fetchall(); conn.close()
+    return [{"key": r[0], "value": r[1], "type": r[2],
+             "source": r[3], "confidence": r[4], "updated_at": r[5]} for r in rows]
+
+
+def delete_user_memory(key: str):
+    user = get_current_user()
+    mid  = hashlib.md5(f"{user}:{key}".encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('DELETE FROM user_memory WHERE memory_id=?', (mid,))
+    conn.commit(); conn.close()
+
+
+def infer_and_save_preferences(question: str, result: dict):
+    ql = question.lower()
+    try:
+        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        c.execute('SELECT DISTINCT query_text FROM question_history WHERE user_name=? ORDER BY asked_at DESC LIMIT 20',
+                  (get_current_user(),))
+        recent = [r[0].lower() for r in c.fetchall()]; conn.close()
+        vendors = st.session_state.get("vendor_list_stable", [])[1:]
+        for v in vendors[:50]:
+            vl = v.lower()
+            cnt = sum(1 for q in recent if vl in q)
+            if cnt >= 3:
+                set_user_memory("frequent_vendor", v, "entity", "inferred", min(cnt/10, 1.0))
+                break
+    except Exception:
+        pass
+
+    if "ytd" in ql:
+        set_user_memory("preferred_preset", "YTD", "preference", "inferred", 0.8)
+    elif "last 30" in ql or "30 days" in ql:
+        set_user_memory("preferred_preset", "Last 30 Days", "preference", "inferred", 0.7)
+    elif "qtd" in ql or "quarter" in ql:
+        set_user_memory("preferred_preset", "QTD", "preference", "inferred", 0.7)
+
+
+def get_cache_with_ttl(question: str, cache_type: str = "genie"):
+    q_hash = hashlib.md5(question.lower().strip().encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''SELECT response_json, created_at, ttl_seconds
+                 FROM query_cache
+                 WHERE query_hash=? AND cache_type=?''', (q_hash, cache_type))
+    row = c.fetchone(); conn.close()
+    if not row:
+        return None
+    response_json, created_at_str, ttl = row
+    try:
+        created_at = datetime.fromisoformat(created_at_str) if isinstance(created_at_str, str) else created_at_str
+        age_seconds = (datetime.now() - created_at).total_seconds()
+        if age_seconds > (ttl or 3600):
+            return None
+    except Exception:
+        pass
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('UPDATE query_cache SET hit_count=hit_count+1, last_hit_at=? WHERE query_hash=?',
+              (datetime.now(), q_hash))
+    conn.commit(); conn.close()
+    return json.loads(response_json)
+
+
+def set_cache_with_ttl(question: str, response: dict,
+                       cache_type: str = "genie", ttl_seconds: int = 3600):
+    q_hash = hashlib.md5(question.lower().strip().encode()).hexdigest()
+    try:
+        response_json = json.dumps(make_json_serializable(response))
+    except Exception:
+        return
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''INSERT OR REPLACE INTO query_cache
+                 (query_hash, question, response_json, created_at, last_hit_at,
+                  hit_count, ttl_seconds, cache_type)
+                 VALUES (?,?,?,?,?,
+                         COALESCE((SELECT hit_count+1 FROM query_cache WHERE query_hash=?),0),
+                         ?,?)''',
+              (q_hash, question, response_json, datetime.now(), datetime.now(),
+               q_hash, ttl_seconds, cache_type))
+    conn.commit(); conn.close()
+
+
+def invalidate_cache(cache_type: str = None):
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    if cache_type:
+        c.execute('DELETE FROM query_cache WHERE cache_type=?', (cache_type,))
+    else:
+        c.execute('DELETE FROM query_cache')
+    conn.commit(); conn.close()
+
+
+def get_cache_stats() -> dict:
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''SELECT
+                    COUNT(*) AS total_entries,
+                    SUM(hit_count) AS total_hits,
+                    AVG(hit_count) AS avg_hits,
+                    cache_type,
+                    COUNT(CASE WHEN (julianday('now') - julianday(created_at))*86400 > ttl_seconds
+                               THEN 1 END) AS expired_count
+                 FROM query_cache
+                 GROUP BY cache_type''')
+    rows = c.fetchall(); conn.close()
+    return [{"type": r[3], "entries": r[0], "total_hits": int(r[1] or 0),
+             "avg_hits": round(r[2] or 0, 1), "expired": int(r[4] or 0)}
+            for r in rows]
+
+
+def save_kpi_snapshot(preset: str, start_date: str, end_date: str, kpi: dict):
+    snap_id = hashlib.md5(f"{get_current_user()}:{preset}:{start_date}:{end_date}".encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''INSERT OR REPLACE INTO kpi_snapshot_cache
+                 (snapshot_id, user_name, preset, start_date, end_date, kpi_json, created_at)
+                 VALUES (?,?,?,?,?,?,?)''',
+              (snap_id, get_current_user(), preset, start_date, end_date,
+               json.dumps(make_json_serializable(kpi)), datetime.now()))
+    conn.commit(); conn.close()
+
+
+def load_kpi_snapshot(preset: str, start_date: str, end_date: str) -> dict:
+    snap_id = hashlib.md5(f"{get_current_user()}:{preset}:{start_date}:{end_date}".encode()).hexdigest()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('SELECT kpi_json FROM kpi_snapshot_cache WHERE snapshot_id=?', (snap_id,))
+    row = c.fetchone(); conn.close()
+    return json.loads(row[0]) if row else {}
+
+
 
 def save_chat_message(session_id, turn_index, role, content, sql_used="", source=""):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -273,6 +589,20 @@ def save_chat_session(session_id: str, label: str = None):
          COALESCE((SELECT last_updated FROM chat_sessions WHERE session_id=?),?),?)''',
         (session_id, label, session_id, datetime.now(), session_id, datetime.now(), get_current_user()))
     conn.commit(); conn.close()
+
+def load_session_messages(session_id: str) -> list:
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute('''SELECT role, content, sql_used, source, timestamp
+                 FROM chat_messages
+                 WHERE session_id = ?
+                 ORDER BY turn_index ASC, timestamp ASC''', (session_id,))
+    rows = c.fetchall(); conn.close()
+    return [
+        {"role": r[0], "content": r[1], "sql_used": r[2],
+         "source": r[3], "timestamp": r[4]}
+        for r in rows
+    ]
+
 
 def save_question(query, analysis_type):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -300,7 +630,7 @@ def set_cache(question, response):
         (q_hash, question, response_json, datetime.now(), datetime.now(), q_hash))
     conn.commit(); conn.close()
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def get_saved_insights_cached(page="genie", limit=20):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute('SELECT insight_id,title,question,verified_query_name,created_at FROM saved_insights WHERE page=? AND created_by=? ORDER BY created_at DESC LIMIT ?',
@@ -308,7 +638,7 @@ def get_saved_insights_cached(page="genie", limit=20):
     rows = c.fetchall(); conn.close()
     return [{"id":r[0],"title":r[1],"question":r[2],"type":r[3],"created_at":r[4]} for r in rows]
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def get_frequent_questions_by_user_cached(limit=10):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute('SELECT normalized_query,COUNT(*) as cnt FROM question_history WHERE user_name=? GROUP BY normalized_query ORDER BY cnt DESC LIMIT ?',
@@ -316,7 +646,7 @@ def get_frequent_questions_by_user_cached(limit=10):
     rows = c.fetchall(); conn.close()
     return [{"query":r[0],"count":r[1]} for r in rows]
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)
 def get_frequent_questions_all_cached(limit=10):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute('SELECT normalized_query,COUNT(*) as cnt FROM question_history GROUP BY normalized_query ORDER BY cnt DESC LIMIT ?', (limit,))
@@ -339,7 +669,18 @@ def get_recent_conversation_context(limit: int = 20, max_age_days: int = 2) -> s
 # ── Dashboard CSS (BG from session_state) ────────────────────
 def inject_dashboard_css():
     bg = st.session_state.get("bg_color", "#ffffff")
+    # Validate color value
+    if not (isinstance(bg, str) and bg.startswith("#") and len(bg) in (4, 7)):
+        bg = "#ffffff"
     st.markdown(f"""<style>
+    /* ── BG color applies to ALL pages globally — persists across all tabs ── */
+    .stApp {{ background-color:{bg} !important; transition: background-color 0.3s ease; }}
+    .main > .block-container {{ background-color:transparent !important; }}
+    html {{ background-color:{bg} !important; }}
+    body {{ background-color:{bg} !important; }}
+    section[data-testid="stMain"] {{ background-color:{bg} !important; }}
+    div[data-testid="stAppViewContainer"] {{ background-color:{bg} !important; }}
+
     button, .stButton button, button[kind="primary"], button[kind="secondary"],
     button[data-testid^="baseButton"], .stDownloadButton button {{
         transition: all 0.2s ease !important;
@@ -352,6 +693,25 @@ def inject_dashboard_css():
     }}
     button[kind="primary"] {{ background-color:#2563eb !important; border-color:#2563eb !important; color:white !important; }}
     button[kind="secondary"] {{ background-color:#f3f4f6 !important; border-color:#d1d5db !important; color:#1f2937 !important; }}
+
+    /* ── FIX 1: Send button hover/click → blue (same as all action buttons) ── */
+    /* Send button: blue on hover/click/focus — all states */
+    div[data-testid="stForm"] button[kind="primaryFormSubmit"],
+    div[data-testid="stForm"] button[kind="primaryFormSubmit"]:hover,
+    div[data-testid="stForm"] button[kind="primaryFormSubmit"]:active,
+    div[data-testid="stForm"] button[kind="primaryFormSubmit"]:focus,
+    div[data-testid="stForm"] button[kind="primaryFormSubmit"]:focus-visible {{
+        background: #2563eb !important;
+        background-color: #2563eb !important;
+        border-color: #2563eb !important;
+        color: white !important;
+        box-shadow: 0 4px 10px rgba(37,99,235,0.3) !important;
+    }}
+
+    /* Needs Attention card backgrounds — all light pink */
+    [class*="st-key-na_bg_overdue"] {{ background:#FFF0F2!important; border:1.5px solid #f5c6cb!important; border-radius:12px!important; box-shadow:0 2px 8px rgba(229,57,53,.06)!important; }}
+    [class*="st-key-na_bg_disputed"] {{ background:#FFF0F2!important; border:1.5px solid #f5c6cb!important; border-radius:12px!important; box-shadow:0 2px 8px rgba(229,57,53,.06)!important; }}
+    [class*="st-key-na_bg_due"] {{ background:#FFF0F2!important; border:1.5px solid #f5c6cb!important; border-radius:12px!important; box-shadow:0 2px 8px rgba(229,57,53,.06)!important; }}
     .kpi-card {{ border-radius:16px; padding:1rem 1.2rem; min-height:100px; display:flex; flex-direction:column; justify-content:center; }}
     .kpi-card-yellow {{ background:linear-gradient(135deg,#fef9c3 0%,#fef08a 100%); }}
     .kpi-card-cyan   {{ background:linear-gradient(135deg,#cffafe 0%,#a5f3fc 100%); }}
@@ -369,8 +729,8 @@ def inject_dashboard_css():
     .grir-card-title {{ font-size:0.7rem; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.6px; }}
     .grir-card-value {{ font-size:1.8rem; font-weight:800; color:#111827; line-height:1.1; }}
     .chart-title {{ font-size:1.1rem; font-weight:700; color:#111827; margin-bottom:0.5rem; }}
-    .main > .block-container {{ background-color:{bg} !important; padding-top:0.5rem !important; }}
     .stApp {{ background-color:{bg} !important; }}
+    .main > .block-container {{ background-color:transparent !important; }}
     .message-user {{ background:linear-gradient(135deg,#3b82f6 0%,#2563eb 100%); color:white;
         padding:10px 16px; border-radius:18px 18px 4px 18px; margin:8px 0;
         max-width:80%; margin-left:auto; text-align:right; }}
@@ -384,16 +744,37 @@ def inject_dashboard_css():
         text-align:center; height:100%; display:flex; flex-direction:column; }}
     .quick-card h3 {{ font-size:1rem; font-weight:600; color:#1e293b; margin:0 0 0.4rem 0; }}
     .quick-card p  {{ font-size:0.8rem; color:#64748b; flex-grow:1; margin:0 0 0.8rem 0; }}
-    /* BG button column — visually anchored bottom right */
-    div[data-testid="stButton"] button[data-testid="baseButton-secondary"]#bg_toggle_btn_btn,
-    button[key="bg_toggle_btn"] {{
-        border-radius: 50px !important;
-        background: linear-gradient(135deg,#2563eb,#1d4ed8) !important;
-        color: white !important;
-        font-weight: 700 !important;
-        font-size: 12px !important;
-        border: none !important;
-        box-shadow: 0 3px 10px rgba(37,99,235,0.35) !important;
+    div[data-testid="stColorPicker"] button {{
+        display: none !important;
+        width: 0 !important; height: 0 !important;
+        overflow: hidden !important; opacity: 0 !important;
+        pointer-events: none !important;
+    }}
+    button[data-testid="baseButton-secondary"][aria-label="BG"],
+    button[data-testid="baseButton-secondary"][aria-label="X"] {{
+        width:52px!important;height:52px!important;
+        min-width:52px!important;max-width:52px!important;
+        min-height:52px!important;max-height:52px!important;
+        border-radius:50%!important;padding:0!important;margin:0!important;
+        background:white!important;color:#374151!important;
+        border:2px solid #e5e7eb!important;
+        box-shadow:0 2px 12px rgba(0,0,0,0.15)!important;
+        font-size:13px!important;font-weight:700!important;
+        line-height:52px!important;text-align:center!important;
+        overflow:hidden!important;display:flex!important;
+        align-items:center!important;justify-content:center!important;
+    }}
+    button[data-testid="baseButton-secondary"][aria-label="BG"]:hover,
+    button[data-testid="baseButton-secondary"][aria-label="X"]:hover {{
+        transform:scale(1.1)!important;
+        box-shadow:0 4px 18px rgba(0,0,0,0.20)!important;
+        background:#f9fafb!important;border-color:#9ca3af!important;
+    }}
+    div[data-testid="stButton"]:has(button[aria-label="BG"]),
+    div[data-testid="stButton"]:has(button[aria-label="X"]) {{
+        width:52px!important;max-width:52px!important;
+        min-width:52px!important;flex:0 0 52px!important;
+        padding:0!important;margin:0!important;
     }}
     </style>""", unsafe_allow_html=True)
 
@@ -417,356 +798,223 @@ def render_grir_metric_card(title: str, value: str, bg_color: str = "#ffffff"):
   <div class="grir-card-value">{value}</div>
 </div>""", unsafe_allow_html=True)
 
-# ── BG Button: fixed bottom-right, pure Streamlit (no JS/HTML floating) ──
 def render_bg_button_sidebar():
-    """
-    BG button — fixed position bottom-right corner.
-    Shows a small "BG" pill button. On click (via session_state toggle),
-    a horizontal row of 8 colour swatches appears just above it.
-    Clicking a swatch sets bg_color and collapses the strip.
-    Uses pure st.markdown HTML/CSS for the fixed-position shell,
-    and st.query_params to ferry the chosen colour back to Python.
-    """
     current_bg = st.session_state.get("bg_color", "#ffffff")
 
-    # Read colour selection from query param (set by JS onclick below)
-    try:
-        qp = st.query_params
-        chosen = qp.get("_bgc", None)
-        if chosen and chosen.startswith("#") and len(chosen) in (4, 7):
-            if chosen != current_bg:
-                st.session_state["bg_color"] = chosen
-                # Clear the param and rerun
-                st.query_params.clear()
-                st.rerun()
-        # Clear stale param even if colour didn't change
-        if chosen:
-            st.query_params.clear()
-    except Exception:
-        pass  # query_params API differs by Streamlit version — safe to skip
-
-    # Build colour swatches HTML — each is a plain <div> with onclick JS
-    # The JS writes the hex to the URL as ?_bgc=HEX which triggers a Streamlit
-    # rerun and is read above.
-    swatches_html = ""
-    for name, hx in BG_COLOR_OPTIONS.items():
-        is_active  = (hx == current_bg)
-        border_col = "#2563eb" if is_active else "#e2e8f0"
-        ring_css   = "box-shadow:0 0 0 3px #2563eb,0 2px 6px rgba(0,0,0,0.18);" if is_active else "box-shadow:0 2px 6px rgba(0,0,0,0.18);"
-        scale_css  = "transform:scale(1.18);" if is_active else ""
-        hover_out  = "scale(1.18)" if is_active else "scale(1)"
-        # Build onclick / onmouseover strings without nested quotes
-        onclick     = "setBgColor('" + hx + "')"
-        on_over     = "this.style.transform='scale(1.25)';this.style.borderColor='#2563eb';"
-        on_out      = "this.style.transform='" + hover_out + "';this.style.borderColor='" + border_col + "';"
-        div_style   = (
-            "width:28px;height:28px;border-radius:50%;background:" + hx + ";"
-            "cursor:pointer;border:2.5px solid " + border_col + ";"
-            + ring_css + scale_css +
-            "transition:all 0.15s ease;flex-shrink:0;"
-        )
-        swatches_html += (
-            '<div title="' + name + '" '
-            'onclick="' + onclick + '" '
-            'style="' + div_style + '" '
-            'onmouseover="' + on_over + '" '
-            'onmouseout="'  + on_out  + '">'
-            '</div>'
-        )
-
-    # Full fixed-position HTML block injected into the page
-    st.markdown(f"""
+    st.markdown("""
 <style>
-#procureiq-bg-root {{
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    z-index: 999999;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 8px;
-    pointer-events: none;
-}}
-#procureiq-bg-root * {{
-    pointer-events: all;
-}}
-#procureiq-bg-strip {{
-    display: none;
-    background: rgba(255,255,255,0.97);
-    border-radius: 50px;
-    padding: 7px 12px;
-    border: 1px solid #e2e8f0;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.14);
-    flex-direction: row;
-    align-items: center;
-    gap: 7px;
-}}
-#procureiq-bg-strip.open {{
-    display: flex;
-}}
-#procureiq-bg-strip span.bg-lbl {{
-    font-size: 10px;
-    font-weight: 700;
-    color: #64748b;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-    white-space: nowrap;
-    margin-right: 4px;
-}}
-#procureiq-bg-btn {{
-    background: linear-gradient(135deg,#2563eb 0%,#1d4ed8 100%);
-    color: white;
-    border: none;
-    border-radius: 50px;
-    padding: 9px 18px;
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-    box-shadow: 0 4px 14px rgba(37,99,235,0.45);
-    letter-spacing: 0.5px;
-    transition: all 0.2s ease;
-    user-select: none;
-}}
-#procureiq-bg-btn:hover {{
-    transform: translateY(-2px);
-    box-shadow: 0 6px 18px rgba(37,99,235,0.55);
-}}
+button[aria-label="BG"] {
+    width:52px!important; height:52px!important;
+    min-width:52px!important; min-height:52px!important;
+    max-width:52px!important; max-height:52px!important;
+    border-radius:50%!important; padding:0!important;
+    font-size:13px!important; font-weight:700!important;
+    background:white!important; color:#374151!important;
+    border:2px solid #e5e7eb!important;
+    box-shadow:0 2px 10px rgba(0,0,0,0.14)!important;
+    outline:none!important; cursor:pointer!important;
+    line-height:52px!important; text-align:center!important;
+}
+button[aria-label="BG"]:hover {
+    transform:scale(1.08)!important;
+    box-shadow:0 4px 16px rgba(0,0,0,0.20)!important;
+    background:#f9fafb!important;
+}
+button[aria-label="BG"]:focus, button[aria-label="BG"]:active {
+    background:white!important; outline:none!important;
+    box-shadow:0 2px 10px rgba(0,0,0,0.14)!important;
+}
+div[data-testid="stButton"]:has(button[aria-label="BG"]) {
+    width:56px!important; max-width:56px!important; padding:0!important;
+}
+div[data-testid="stColorPicker"] label { display:none!important; }
+div[data-testid="stColorPicker"] button {
+    display:none!important; visibility:hidden!important;
+    width:0!important; height:0!important;
+    position:absolute!important; pointer-events:none!important;
+}
 </style>
-
-<div id="procureiq-bg-root">
-    <div id="procureiq-bg-strip">
-        <span class="bg-lbl">BG</span>
-        {swatches_html}
-    </div>
-    <button id="procureiq-bg-btn" onclick="toggleBgStrip()">BG</button>
-</div>
-
-<script>
-function toggleBgStrip() {{
-    var strip = document.getElementById('procureiq-bg-strip');
-    strip.classList.toggle('open');
-}}
-
-function setBgColor(hex) {{
-    // 1. Apply instantly to the visible DOM
-    var targets = [
-        window.parent.document.querySelector('.stApp'),
-        window.parent.document.querySelector('.main'),
-    ].concat(Array.from(window.parent.document.querySelectorAll('.main > .block-container')));
-    targets.forEach(function(el) {{ if (el) el.style.backgroundColor = hex; }});
-
-    // 2. Persist to localStorage so it survives reloads
-    try {{ window.parent.localStorage.setItem('procureiq_bg', hex); }} catch(e) {{}}
-
-    // 3. Trigger Streamlit rerun by navigating with query param
-    var url = new URL(window.parent.location.href);
-    url.searchParams.set('_bgc', hex);
-    window.parent.history.pushState({{}}, '', url.toString());
-    // Fire a popstate so Streamlit picks up the param change
-    window.parent.dispatchEvent(new PopStateEvent('popstate', {{ state: {{}} }}));
-
-    // Close the strip
-    var strip = document.getElementById('procureiq-bg-strip');
-    if (strip) strip.classList.remove('open');
-}}
-
-// On page load, restore saved colour from localStorage
-(function() {{
-    try {{
-        var saved = window.parent.localStorage.getItem('procureiq_bg');
-        if (saved) {{
-            var targets = [
-                window.parent.document.querySelector('.stApp'),
-                window.parent.document.querySelector('.main'),
-            ].concat(Array.from(window.parent.document.querySelectorAll('.main > .block-container')));
-            targets.forEach(function(el) {{ if (el) el.style.backgroundColor = saved; }});
-        }}
-    }} catch(e) {{}}
-}})();
-</script>
 """, unsafe_allow_html=True)
 
+    safe_val = current_bg if (
+        current_bg.startswith("#") and len(current_bg) in (4, 7)
+    ) else "#ffffff"
+    picked = st.color_picker(
+        "bg", value=safe_val,
+        key="bg_cp", label_visibility="collapsed",
+    )
+    if picked != current_bg:
+        st.session_state["bg_color"] = picked
+        st.rerun()
 
-# ── FIXED KPI fetching using correct view column names ───────
-@st.cache_data(ttl=300, show_spinner=False)
+    st.button("BG", key="bg_pill_btn", use_container_width=False)
+
+# ── FIXED KPI fetching ───────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_kpi_data(start_lit: str, end_lit: str, vendor_where: str,
                    start_iso: str, end_iso: str) -> dict:
-    """
-    All 8 KPIs fetched from correct Athena views.
-    KEY FIXES:
-      - payment_processing_cycle_time_vw: no posting_date; uses year/month;
-        column = avg_payment_cycle_time_days
-      - full_payment_rate_vw: no posting_date; uses year/month;
-        column = full_payment_rate_pct (not full_payment_rate)
-      - active_vendors = COUNT(DISTINCT vendor_name) from dim_vendor_vw joined to fact
-    """
     start = date.fromisoformat(start_iso)
     end   = date.fromisoformat(end_iso)
     ym    = year_month_filter(start, end)
-    result = {}
 
-    # 1. Spend / POs / pending — fact_all_sources_vw (has posting_date)
-    main_sql = f"""
-        SELECT
-            SUM(CASE WHEN UPPER(f.invoice_status) NOT IN ('CANCELLED','REJECTED')
-                     THEN COALESCE(f.invoice_amount_local,0) ELSE 0 END)    AS total_spend,
-            COUNT(DISTINCT CASE WHEN UPPER(f.invoice_status)='OPEN'
-                                THEN f.purchase_order_reference END)         AS active_pos,
-            COUNT(DISTINCT f.purchase_order_reference)                       AS total_pos,
-            COUNT(DISTINCT CASE WHEN UPPER(f.invoice_status)='OPEN'
-                                THEN f.invoice_number END)                   AS pending_inv
-        FROM {DATABASE}.fact_all_sources_vw f
-        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
-        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
-        {vendor_where}
-    """
-    df = run_query(main_sql)
-    if not df.empty:
-        result["total_spend"] = safe_number(df.iloc[0]["total_spend"])
-        result["active_pos"]  = safe_int(df.iloc[0]["active_pos"])
-        result["total_pos"]   = safe_int(df.iloc[0]["total_pos"])
-        result["pending_inv"] = safe_int(df.iloc[0]["pending_inv"])
-    else:
-        result["total_spend"] = result["active_pos"] = result["total_pos"] = result["pending_inv"] = 0
-
-    # 2. Active vendors — COUNT(DISTINCT vendor_name)
-    vsql = f"""
-        SELECT COUNT(DISTINCT v.vendor_name) AS active_vendors
-        FROM {DATABASE}.fact_all_sources_vw f
-        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
-        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
-          AND v.vendor_name IS NOT NULL
-        {vendor_where}
-    """
-    vdf = run_query(vsql)
-    if not vdf.empty:
-        result["active_vendors"] = safe_int(vdf.iloc[0]["active_vendors"])
-    else:
-        # fallback: all vendors in dim table
-        fvdf = run_query(f"SELECT COUNT(DISTINCT vendor_name) AS c FROM {DATABASE}.dim_vendor_vw WHERE vendor_name IS NOT NULL")
-        result["active_vendors"] = safe_int(fvdf.iloc[0]["c"]) if not fvdf.empty else 0
-
-    # 3. Avg processing time — payment_processing_cycle_time_vw
-    #    Correct columns: year, month, avg_payment_cycle_time_days
-    #    NO posting_date column — filter by year/month
-    cycle_sql = f"""
-        SELECT AVG(CAST(avg_payment_cycle_time_days AS DOUBLE)) AS avg_days
-        FROM {DATABASE}.payment_processing_cycle_time_vw
-        WHERE {ym}
-    """
-    cdf = run_query(cycle_sql)
-    if not cdf.empty and not pd.isna(cdf.iloc[0]["avg_days"]):
-        result["avg_processing_days"] = safe_number(cdf.iloc[0]["avg_days"])
-    else:
-        # fallback from fact table
-        fb = run_query(f"""
-            SELECT AVG(CAST(DATE_DIFF('day',posting_date,payment_date) AS DOUBLE)) AS avg_days
-            FROM {DATABASE}.fact_all_sources_vw
-            WHERE UPPER(invoice_status) IN ('PAID','CLEARED') AND payment_date IS NOT NULL
-              AND posting_date BETWEEN {start_lit} AND {end_lit}
-        """)
-        result["avg_processing_days"] = safe_number(fb.iloc[0]["avg_days"]) if not fb.empty else 0.0
-
-    # 4. First pass rate — full_payment_rate_vw
-    #    Correct columns: year, month, full_paid_invoices, total_cleared_invoices, full_payment_rate_pct
-    #    NO posting_date — filter by year/month
-    fp_sql = f"""
-        SELECT SUM(CAST(full_paid_invoices AS BIGINT))     AS full_paid,
-               SUM(CAST(total_cleared_invoices AS BIGINT)) AS total_cleared
-        FROM {DATABASE}.full_payment_rate_vw
-        WHERE {ym}
-    """
-    fpdf = run_query(fp_sql)
-    if not fpdf.empty:
-        fp = safe_number(fpdf.iloc[0]["full_paid"])
-        tc = safe_number(fpdf.iloc[0]["total_cleared"])
-        result["first_pass_rate"] = (fp / tc * 100) if tc > 0 else 0.0
-    else:
-        # fallback from invoice_status_history_vw
-        fb2 = run_query(f"""
-            WITH hist AS (
-                SELECT invoice_number,
-                    MAX(CASE WHEN UPPER(status) IN ('PAID','CLEARED','CLOSED','POSTED','SETTLED') THEN 1 ELSE 0 END) AS has_paid,
-                    MAX(CASE WHEN UPPER(status) IN ('DISPUTE','DISPUTED','OVERDUE') THEN 1 ELSE 0 END) AS has_issue
-                FROM {DATABASE}.invoice_status_history_vw
-                WHERE posting_date BETWEEN {start_lit} AND {end_lit}
-                GROUP BY invoice_number
-            )
-            SELECT COUNT(*) AS total_inv,
-                   SUM(CASE WHEN has_paid=1 AND has_issue=0 THEN 1 ELSE 0 END) AS first_pass_inv
-            FROM hist
-        """)
-        if not fb2.empty:
-            t = safe_int(fb2.iloc[0]["total_inv"]); p2 = safe_int(fb2.iloc[0]["first_pass_inv"])
-            result["first_pass_rate"] = (p2/t*100) if t > 0 else 0.0
-        else:
-            result["first_pass_rate"] = 0.0
-
-    # 5. Auto-processed rate — invoice_status_history_vw
-    auto_sql = f"""
-        WITH paid AS (
-            SELECT status_notes FROM {DATABASE}.invoice_status_history_vw
+    merged_sql = f"""
+        WITH fact_agg AS (
+            SELECT
+                SUM(CASE WHEN UPPER(f.invoice_status) NOT IN ('CANCELLED','REJECTED')
+                         THEN COALESCE(f.invoice_amount_local,0) ELSE 0 END)      AS total_spend,
+                COUNT(DISTINCT CASE WHEN UPPER(f.invoice_status)='OPEN'
+                                    THEN f.purchase_order_reference END)           AS active_pos,
+                COUNT(DISTINCT f.purchase_order_reference)                         AS total_pos,
+                COUNT(DISTINCT CASE WHEN UPPER(f.invoice_status)='OPEN'
+                                    THEN f.invoice_number END)                     AS pending_inv,
+                COUNT(DISTINCT CASE WHEN v.vendor_name IS NOT NULL
+                                    THEN v.vendor_name END)                        AS active_vendors
+            FROM {DATABASE}.fact_all_sources_vw f
+            LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id = v.vendor_id
+            WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
+            {vendor_where}
+        ),
+        cycle_agg AS (
+            SELECT AVG(CAST(avg_payment_cycle_time_days AS DOUBLE)) AS avg_days
+            FROM {DATABASE}.payment_processing_cycle_time_vw
+            WHERE {ym}
+        ),
+        fp_agg AS (
+            SELECT
+                SUM(CAST(full_paid_invoices AS BIGINT))     AS full_paid,
+                SUM(CAST(total_cleared_invoices AS BIGINT)) AS total_cleared
+            FROM {DATABASE}.full_payment_rate_vw
+            WHERE {ym}
+        ),
+        auto_agg AS (
+            SELECT
+                COUNT(*) AS total_cleared_inv,
+                SUM(CASE WHEN UPPER(status_notes)='AUTO PROCESSED' THEN 1 ELSE 0 END) AS auto_proc
+            FROM {DATABASE}.invoice_status_history_vw
             WHERE posting_date BETWEEN {start_lit} AND {end_lit}
               AND UPPER(status) IN ('PAID','CLEARED')
         )
-        SELECT COUNT(*) AS total_cleared,
-               SUM(CASE WHEN UPPER(status_notes)='AUTO PROCESSED' THEN 1 ELSE 0 END) AS auto_processed
-        FROM paid
+        SELECT
+            fa.total_spend, fa.active_pos, fa.total_pos,
+            fa.pending_inv, fa.active_vendors,
+            ca.avg_days          AS avg_processing_days,
+            fp.full_paid         AS fp_full_paid,
+            fp.total_cleared     AS fp_total_cleared,
+            aa.total_cleared_inv AS auto_total,
+            aa.auto_proc         AS auto_processed
+        FROM fact_agg fa
+        CROSS JOIN cycle_agg ca
+        CROSS JOIN fp_agg fp
+        CROSS JOIN auto_agg aa
     """
-    adf = run_query(auto_sql)
-    if not adf.empty:
-        tc2 = safe_int(adf.iloc[0]["total_cleared"]); ap = safe_int(adf.iloc[0]["auto_processed"])
-        result["auto_rate"] = (ap/tc2*100) if tc2 > 0 else 0.0
-    else:
-        result["auto_rate"] = 0.0
+    df = run_query(merged_sql)
 
-    return result
+    if df.empty:
+        return {
+            "total_spend": 0.0, "active_pos": 0, "total_pos": 0,
+            "pending_inv": 0, "active_vendors": 0,
+            "avg_processing_days": 0.0, "first_pass_rate": 0.0, "auto_rate": 0.0,
+        }
 
-@st.cache_data(ttl=300, show_spinner=False)
+    row = df.iloc[0]
+    total_spend      = safe_number(row["total_spend"])
+    active_pos       = safe_int(row["active_pos"])
+    total_pos        = safe_int(row["total_pos"])
+    pending_inv      = safe_int(row["pending_inv"])
+    active_vendors   = safe_int(row["active_vendors"])
+    avg_proc_days    = safe_number(row.get("avg_processing_days"))
+    fp_paid          = safe_number(row.get("fp_full_paid", 0))
+    fp_cleared       = safe_number(row.get("fp_total_cleared", 0))
+    first_pass_rate  = (fp_paid / fp_cleared * 100) if fp_cleared > 0 else 0.0
+    auto_total       = safe_int(row.get("auto_total", 0))
+    auto_proc        = safe_int(row.get("auto_processed", 0))
+    auto_rate        = (auto_proc / auto_total * 100) if auto_total > 0 else 0.0
+
+    if avg_proc_days == 0.0 or pd.isna(avg_proc_days):
+        fb = run_query(f"""
+            SELECT AVG(CAST(DATE_DIFF('day',posting_date,payment_date) AS DOUBLE)) AS avg_days
+            FROM {DATABASE}.fact_all_sources_vw
+            WHERE UPPER(invoice_status) IN ('PAID','CLEARED')
+              AND payment_date IS NOT NULL
+              AND posting_date BETWEEN {start_lit} AND {end_lit}
+        """)
+        avg_proc_days = safe_number(fb.iloc[0]["avg_days"]) if not fb.empty else 0.0
+
+    return {
+        "total_spend":          total_spend,
+        "active_pos":           active_pos,
+        "total_pos":            total_pos,
+        "pending_inv":          pending_inv,
+        "active_vendors":       active_vendors,
+        "avg_processing_days":  avg_proc_days,
+        "first_pass_rate":      first_pass_rate,
+        "auto_rate":            auto_rate,
+    }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_needs_attention(start_lit: str, end_lit: str, vendor_where: str):
-    overdue_sql = f"""
-        SELECT f.invoice_number AS ref_no, f.invoice_amount_local AS amount,
-               v.vendor_name, f.due_date, f.aging_days
+    union_sql = f"""
+        SELECT f.invoice_number AS ref_no,
+               f.invoice_amount_local AS amount,
+               v.vendor_name,
+               f.due_date,
+               f.aging_days,
+               'OVERDUE' AS category
         FROM {DATABASE}.fact_all_sources_vw f
-        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
-        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit} {vendor_where}
-          AND f.due_date < CURRENT_DATE AND UPPER(f.invoice_status)='OVERDUE'
-        ORDER BY f.due_date ASC
-    """
-    disputed_sql = f"""
-        SELECT f.invoice_number AS ref_no, f.invoice_amount_local AS amount,
-               v.vendor_name, f.due_date, f.aging_days
+        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id = v.vendor_id
+        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
+          {vendor_where}
+          AND f.due_date < CURRENT_DATE
+          AND UPPER(f.invoice_status) = 'OVERDUE'
+
+        UNION ALL
+
+        SELECT f.invoice_number AS ref_no,
+               f.invoice_amount_local AS amount,
+               v.vendor_name,
+               f.due_date,
+               f.aging_days,
+               'DISPUTED' AS category
         FROM {DATABASE}.fact_all_sources_vw f
-        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
-        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit} {vendor_where}
+        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id = v.vendor_id
+        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
+          {vendor_where}
           AND UPPER(f.invoice_status) IN ('DISPUTE','DISPUTED')
-        ORDER BY f.due_date ASC
-    """
-    due_sql = f"""
-        SELECT f.invoice_number AS ref_no, f.invoice_amount_local AS amount,
-               v.vendor_name, f.due_date, f.aging_days
+
+        UNION ALL
+
+        SELECT f.invoice_number AS ref_no,
+               f.invoice_amount_local AS amount,
+               v.vendor_name,
+               f.due_date,
+               f.aging_days,
+               'DUE' AS category
         FROM {DATABASE}.fact_all_sources_vw f
-        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
-        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit} {vendor_where}
+        LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id = v.vendor_id
+        WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
+          {vendor_where}
           AND f.due_date >= CURRENT_DATE
           AND f.due_date <= CURRENT_DATE + INTERVAL '30' DAY
-          AND UPPER(f.invoice_status)='OPEN'
-        ORDER BY f.due_date ASC
+          AND UPPER(f.invoice_status) = 'OPEN'
+
+        ORDER BY due_date ASC
     """
-    return run_query(overdue_sql), run_query(disputed_sql), run_query(due_sql)
+    all_df = run_query(union_sql)
+    if all_df.empty:
+        empty = pd.DataFrame(columns=["ref_no","amount","vendor_name","due_date","aging_days"])
+        return empty, empty, empty
+
+    overdue_df  = all_df[all_df["category"] == "OVERDUE"].drop(columns=["category"]).reset_index(drop=True)
+    disputed_df = all_df[all_df["category"] == "DISPUTED"].drop(columns=["category"]).reset_index(drop=True)
+    due_df      = all_df[all_df["category"] == "DUE"].drop(columns=["category"]).reset_index(drop=True)
+    return overdue_df, disputed_df, due_df
 
 def _load_vendor_list():
-    """
-    Load vendor list into a SINGLE stable session_state key: "vendor_list_stable".
-    Only re-fetches when the date range actually changes.
-    This prevents the selectbox from duplicating when preset buttons are clicked.
-    """
     rng_start, rng_end = st.session_state.date_range
     last_start = st.session_state.get("_vendor_list_last_start")
     last_end   = st.session_state.get("_vendor_list_last_end")
 
-    # Only re-query when date range truly changed
     needs_reload = (
         "vendor_list_stable" not in st.session_state
         or last_start != rng_start
@@ -774,42 +1022,24 @@ def _load_vendor_list():
     )
 
     if needs_reload:
-        vdf = run_query(f"""
-            SELECT DISTINCT v.vendor_name
-            FROM {DATABASE}.fact_all_sources_vw f
-            LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id = v.vendor_id
-            WHERE f.posting_date BETWEEN {sql_date(rng_start)} AND {sql_date(rng_end)}
-              AND v.vendor_name IS NOT NULL
-            ORDER BY 1
-        """)
+        vdf = run_query(
+            f"SELECT DISTINCT v.vendor_name "
+            f"FROM {DATABASE}.fact_all_sources_vw f "
+            f"LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id "
+            f"WHERE f.posting_date BETWEEN {sql_date(rng_start)} AND {sql_date(rng_end)} "
+            f"AND v.vendor_name IS NOT NULL "
+            f"ORDER BY 1"
+        )
         new_list = (["All Vendors"] + vdf["vendor_name"].tolist()
                     if not vdf.empty else ["All Vendors"])
-        st.session_state["vendor_list_stable"]   = new_list
+        st.session_state["vendor_list_stable"]      = new_list
         st.session_state["_vendor_list_last_start"] = rng_start
         st.session_state["_vendor_list_last_end"]   = rng_end
-
-        # If previously selected vendor is not in new list, reset to All Vendors
-        if st.session_state.selected_vendor not in st.session_state["vendor_list_stable"]:
+        if st.session_state.selected_vendor not in new_list:
             st.session_state.selected_vendor = "All Vendors"
 
 
 def render_filters():
-    """
-    Renders date range, vendor selector, and preset buttons.
-
-    KEY FIX — vendor list duplication:
-    ─────────────────────────────────
-    Root cause: old code used a date-keyed cache (vendor_list_2026-01-01_2026-06-11)
-    so each preset click created a brand-new list in session_state, and the
-    selectbox (with a fixed key) received a different options list every render,
-    causing Streamlit to reset and visually duplicate the dropdown.
-
-    Fix: single stable key "vendor_list_stable" managed by _load_vendor_list().
-    The list is only reloaded when the date range actually changes — NOT on every
-    preset button click. The selectbox always reads from the same stable key and
-    the same widget key, so it never duplicates.
-    """
-    # ── Step 1: ensure vendor list is loaded (stable single key) ──
     _load_vendor_list()
 
     rng_start, rng_end = st.session_state.date_range
@@ -817,9 +1047,51 @@ def render_filters():
     current_preset     = st.session_state.preset
     vendor_list        = st.session_state["vendor_list_stable"]
 
-    col_date, col_vendor, col_preset = st.columns([1.2, 1.2, 2.8], gap="small")
+    st.markdown("""
+<style>
+section.main div[data-testid="stHorizontalBlock"]:nth-of-type(2) {
+    align-items: center !important;
+    min-height: 44px !important;
+}
+div[data-testid="stDateInput"] input {
+    height: 40px !important;
+    min-height: 40px !important;
+    border-radius: 8px !important;
+    font-size: 13px !important;
+    padding: 0 10px !important;
+    white-space: nowrap !important;
+}
+div[data-testid="stSelectbox"] > div {
+    height: 40px !important;
+    min-height: 40px !important;
+}
+div[data-testid="stSelectbox"] > div > div {
+    height: 40px !important;
+    min-height: 40px !important;
+    border-radius: 8px !important;
+    font-size: 13px !important;
+    padding: 0 10px !important;
+    display: flex !important;
+    align-items: center !important;
+}
+div[data-testid="stHorizontalBlock"]:nth-of-type(2) button {
+    height: 40px !important;
+    min-height: 40px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    font-size: 13px !important;
+    padding: 0 12px !important;
+    border-radius: 8px !important;
+    line-height: 1 !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
-    # ── Date range picker ──────────────────────────────────────
+    col_date, col_vendor, col_l30, col_qtd, col_ytd, col_custom = st.columns(
+        [1.4, 1.4, 1.35, 0.75, 0.75, 0.75], gap="small"
+    )
+
     with col_date:
         date_range = st.date_input(
             "Date Range",
@@ -831,51 +1103,45 @@ def render_filters():
         if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
             ns, ne = date_range
             if (ns, ne) != (rng_start, rng_end):
-                # Only update if this came from manual user edit, not a preset click
                 if not st.session_state.get("_preset_clicked", False):
                     st.session_state.date_range = (ns, ne)
                     st.session_state.preset     = "Custom"
-                    # Force vendor list reload on next render
                     st.session_state.pop("vendor_list_stable", None)
                 else:
                     st.session_state._preset_clicked = False
 
-    # ── Vendor selector — ONE selectbox, ONE stable key, never duplicates ──
     with col_vendor:
-        # Compute index safely
         try:
             v_idx = vendor_list.index(selected_vendor)
         except ValueError:
             v_idx = 0
-
-        # Single widget — key never changes, options list never changes mid-render
         chosen = st.selectbox(
             "Vendor",
             options=vendor_list,
             index=v_idx,
             label_visibility="collapsed",
-            key="vendor_selectbox_stable",   # stable key — never regenerated
+            key="vendor_selectbox_stable",
         )
-        # Write back only when the value actually changed
         if chosen != st.session_state.selected_vendor:
             st.session_state.selected_vendor = chosen
 
-    # ── Preset buttons ─────────────────────────────────────────
-    with col_preset:
-        presets = ["Last 30 Days", "QTD", "YTD", "Custom"]
-        p_cols  = st.columns(4, gap="small")
-        for i2, p in enumerate(presets):
-            with p_cols[i2]:
-                btn_type = "primary" if p == current_preset else "secondary"
-                if st.button(p, key=f"preset_{p}", use_container_width=True, type=btn_type):
-                    st.session_state._preset_clicked = True
-                    if p != "Custom":
-                        ns2, ne2 = compute_range_preset(p)
-                        st.session_state.date_range = (ns2, ne2)
-                        # Force vendor list reload for new date range
-                        st.session_state.pop("vendor_list_stable", None)
-                    st.session_state.preset = p
-                    st.rerun()
+    preset_map = [
+        (col_l30,    "Last 30 Days"),
+        (col_qtd,    "QTD"),
+        (col_ytd,    "YTD"),
+        (col_custom, "Custom"),
+    ]
+    for p_col, p in preset_map:
+        with p_col:
+            btn_type = "primary" if p == current_preset else "secondary"
+            if st.button(p, key=f"preset_{p}", use_container_width=True, type=btn_type):
+                st.session_state._preset_clicked = True
+                if p != "Custom":
+                    ns2, ne2 = compute_range_preset(p)
+                    st.session_state.date_range = (ns2, ne2)
+                    st.session_state.pop("vendor_list_stable", None)
+                st.session_state.preset = p
+                st.rerun()
 
     return (
         st.session_state.date_range[0],
@@ -916,205 +1182,533 @@ def render_kpi_rows(kpi: dict, prev_kpi: dict):
     st.markdown("<div style='height:0.75rem;'></div>", unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4)
     with col1: render_kpi_card("PENDING INVOICES", f"{cur_pend:,}", pend_d, not pend_up, "yellow")
-    with col2: render_kpi_card("AVG INVOICE PROCESSING TIME", f"{cur_avg:.1f}d", avg_d_str, avg_up, "cyan")
+    with col2: render_kpi_card("AVG PROCESSING TIME", f"{cur_avg:.1f}d", avg_d_str, avg_up, "cyan")
     with col3: render_kpi_card("FIRST PASS INVOICES %", f"{cur_fp:.1f}%", fp_d_str, fp_up, "green")
-    with col4: render_kpi_card("AUTOPROCESSED INVOICES %", f"{auto_rate:.1f}%", "-", True, "green")
+    auto_delta = f"+{auto_rate:.1f}%"
+    with col4: render_kpi_card("AUTOPROCESSED INVOICES %", f"{auto_rate:.1f}%", auto_delta, True, "green")
 
 def render_needs_attention(rng_start, rng_end, vendor_where):
-    for k,v in [("na_tab","Overdue"),("na_page",0)]:
-        if k not in st.session_state: st.session_state[k] = v
+    for k, v in [("na_tab", "Overdue"), ("na_page", 0)]:
+        if k not in st.session_state:
+            st.session_state[k] = v
+
     current_tab = st.session_state.na_tab
     page        = st.session_state.na_page
-    start_lit   = sql_date(rng_start); end_lit = sql_date(rng_end)
+    start_lit   = sql_date(rng_start)
+    end_lit     = sql_date(rng_end)
 
     overdue_df, disputed_df, due_df = fetch_needs_attention(start_lit, end_lit, vendor_where)
-    oc = len(overdue_df); dc = len(disputed_df); duc = len(due_df)
+    oc  = len(overdue_df)
+    dc  = len(disputed_df)
+    duc = len(due_df)
     urgent = oc + dc + duc
 
-    with st.container(border=True):
-        st.markdown(f"<div style='font-size:18px;font-weight:900;color:#1a1a1a;padding:0.2rem 0.5rem;'>"
-                    f"Needs Attention <span style='font-weight:700;color:#6b7280;'>({urgent:,})</span></div>",
-                    unsafe_allow_html=True)
-        tc1, tc2, tc3 = st.columns([1,1,1], gap="small")
-        with tc1:
-            t = "primary" if current_tab=="Overdue" else "secondary"
-            if st.button(f"Overdue ({oc})", key="na_btn_overdue", use_container_width=True, type=t):
-                st.session_state.na_tab="Overdue"; st.session_state.na_page=0; st.rerun()
-        with tc2:
-            t = "primary" if current_tab=="Disputed" else "secondary"
-            if st.button(f"Disputed ({dc})", key="na_btn_disputed", use_container_width=True, type=t):
-                st.session_state.na_tab="Disputed"; st.session_state.na_page=0; st.rerun()
-        with tc3:
-            t = "primary" if current_tab=="Due" else "secondary"
-            if st.button(f"Due ({duc})", key="na_btn_due30d", use_container_width=True, type=t):
-                st.session_state.na_tab="Due"; st.session_state.na_page=0; st.rerun()
+    if current_tab == "Overdue":
+        df = overdue_df;  sl = "Overdue";  tc_color = "#e53935"
+    elif current_tab == "Disputed":
+        df = disputed_df; sl = "Disputed"; tc_color = "#e53935"
+    else:
+        df = due_df;      sl = "Due soon"; tc_color = "#2e7d32"
 
-        st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
-        if   current_tab=="Overdue":  df=overdue_df;  sl="Overdue";  tbg="#FEE2E2"; tc="#991B1B"
-        elif current_tab=="Disputed": df=disputed_df; sl="Disputed"; tbg="#FEF3C7"; tc="#92400E"
-        else:                         df=due_df;       sl="Due soon"; tbg="#DBEAFE"; tc="#1E3A8A"
+    st.markdown(f"""
+<style>
+.na-title {{
+    font-size: 16px; font-weight: 800; color: #111827;
+    margin-bottom: 10px;
+}}
+.na-title span {{ font-weight: 600; color: #6b7280; font-size: 14px; }}
+.na-tabs-row button {{
+    height: 44px !important;
+    min-height: 44px !important;
+    border-radius: 999px !important;
+    font-size: 14px !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
+    border: 1.5px solid #e0e0e0 !important;
+}}
+.na-tabs-row button[kind="secondary"] {{
+    background: #f3f4f6 !important;
+    color: #374151 !important;
+    box-shadow: none !important;
+}}
+.na-tabs-row button[kind="primary"] {{
+    background: #2563eb !important;
+    color: white !important;
+    border-color: #2563eb !important;
+    box-shadow: 0 2px 8px rgba(37,99,235,0.25) !important;
+}}
+.na-cards-grid {{
+    margin-top: 12px;
+}}
+.na-cards-grid div[data-testid="stVerticalBlockBorderWrapper"] {{
+    background: #FFF0F2 !important;
+    border: 1.5px solid #f5c6cb !important;
+    border-radius: 12px !important;
+    box-shadow: 0 1px 4px rgba(229,57,53,0.06) !important;
+    overflow: visible !important;
+}}
+/* Invoice number button stays inside card — light pink bg matches card */
+.na-cards-grid div[data-testid="stVerticalBlockBorderWrapper"]
+  div[data-testid="stVerticalBlock"] > div:first-child button {{
+    background: #ffe4e8 !important;
+    border: 1px solid #f5c6cb !important;
+    border-radius: 8px !important;
+    color: #b42318 !important;
+    font-size: 13px !important;
+    font-weight: 700 !important;
+    height: 28px !important;
+    min-height: 28px !important;
+    padding: 0 10px !important;
+    box-shadow: none !important;
+    width: auto !important;
+    max-width: none !important;
+}}
+.na-cards-grid div[data-testid="stVerticalBlockBorderWrapper"]
+  > div[data-testid="stVerticalBlock"] {{
+    padding: 8px 10px 8px 10px !important;
+    gap: 0 !important;
+}}
+.na-cards-grid div[data-testid="stVerticalBlockBorderWrapper"] button {{
+    background:    #f3f4f6 !important;
+    border:        1px solid #d1d5db !important;
+    border-radius: 8px !important;
+    color:         #374151 !important;
+    font-size:     13px !important;
+    font-weight:   700 !important;
+    height:        28px !important;
+    min-height:    28px !important;
+    padding:       0 10px !important;
+    box-shadow:    none !important;
+    outline:       none !important;
+    white-space:   nowrap !important;
+    max-width:     none !important;
+    width:         auto !important;
+}}
+.na-cards-grid div[data-testid="stVerticalBlockBorderWrapper"] button:hover {{
+    background:    #eff6ff !important;
+    border-color:  #2563eb !important;
+    color:         #2563eb !important;
+    box-shadow:    none !important;
+    outline:       none !important;
+}}
+.na-cards-grid div[data-testid="stVerticalBlockBorderWrapper"] button:focus,
+.na-cards-grid div[data-testid="stVerticalBlockBorderWrapper"] button:focus-visible,
+.na-cards-grid div[data-testid="stVerticalBlockBorderWrapper"] button:active {{
+    background:         #f3f4f6 !important;
+    border-color:       #d1d5db !important;
+    box-shadow:         none !important;
+    -webkit-box-shadow: none !important;
+    outline:            none !important;
+    outline-width:      0 !important;
+}}
+.na-page-row button {{
+    height: 38px !important;
+    min-height: 38px !important;
+    border-radius: 8px !important;
+    font-size: 13px !important;
+    background: #f3f4f6 !important;
+    border: 1px solid #e0e0e0 !important;
+    color: #374151 !important;
+    box-shadow: none !important;
+}}
+.na-page-info {{
+    text-align: center; color: #6b7280;
+    font-size: 13px; padding: 8px 0;
+}}
+</style>
+""", unsafe_allow_html=True)
+
+    with st.container(border=True):
+        st.markdown(
+            f"<div class='na-title'>Needs Attention "
+            f"<span>({urgent:,})</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("<div class='na-tabs-row'>", unsafe_allow_html=True)
+        tc1, tc2, tc3 = st.columns([1, 1, 1], gap="small")
+        with tc1:
+            t = "primary" if current_tab == "Overdue" else "secondary"
+            if st.button(f"Overdue ({oc})", key="na_btn_overdue", use_container_width=True, type=t):
+                st.session_state.na_tab = "Overdue"; st.session_state.na_page = 0; st.rerun()
+        with tc2:
+            t = "primary" if current_tab == "Disputed" else "secondary"
+            if st.button(f"Disputed ({dc})", key="na_btn_disputed", use_container_width=True, type=t):
+                st.session_state.na_tab = "Disputed"; st.session_state.na_page = 0; st.rerun()
+        with tc3:
+            t = "primary" if current_tab == "Due" else "secondary"
+            if st.button(f"Due ({duc})", key="na_btn_due30d", use_container_width=True, type=t):
+                st.session_state.na_tab = "Due"; st.session_state.na_page = 0; st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
 
         if df.empty:
-            st.markdown('<div style="padding:1rem;color:#64748b;">No items in this category</div>', unsafe_allow_html=True)
+            st.markdown(
+                "<div style='padding:1.5rem;color:#64748b;text-align:center;'>"
+                "No items in this category</div>",
+                unsafe_allow_html=True,
+            )
         else:
-            ipp = 8; tot = len(df); tp = max(1,(tot+ipp-1)//ipp)
-            si = page*ipp; ei = min(si+ipp, tot)
-            page_df = df.iloc[si:ei]; gi = 0
+            ipp = 8; tot = len(df); tp = max(1, (tot + ipp - 1) // ipp)
+            si2 = page * ipp; ei2 = min(si2 + ipp, tot)
+            page_df = df.iloc[si2:ei2]; gi = 0
+
+            st.markdown("<div class='na-cards-grid'>", unsafe_allow_html=True)
+
             for chunk_start in range(0, len(page_df), 4):
-                row_chunk = page_df.iloc[chunk_start:chunk_start+4]
-                cols = st.columns(4, gap="medium")
+                row_chunk = page_df.iloc[chunk_start:chunk_start + 4]
+                cols = st.columns(4, gap="small")
                 for col, (_, r) in zip(cols, row_chunk.iterrows()):
                     with col:
-                        with st.container(border=True):
-                            left, right = st.columns([2,1], gap="small")
-                            with left:
-                                ref = format_invoice_number(str(r.get("ref_no","—")).strip() or "—")
-                                bk = f"na_card_{si}_{gi}_{ref[:30]}"
-                                if st.button(ref, key=bk):
-                                    st.session_state["invoice_search_from_card"] = ref
-                                    st.session_state["page"] = "Invoices"
-                                    st.experimental_set_query_params(invoice=ref); st.rerun()
-                                st.markdown(f"<div style='color:#64748b;font-size:12px;'>{html.escape(str(r.get('vendor_name','—')))}</div>",
-                                            unsafe_allow_html=True)
-                            with right:
-                                amt = safe_number(r.get("amount"))
-                                ddr = r.get("due_date")
-                                dd = pd.to_datetime(ddr).date().isoformat() if pd.notna(ddr) else "—"
-                                st.markdown(f"<div style='text-align:right;'>"
-                                            f"<span style='background:{tbg};color:{tc};font-size:12px;padding:4px 10px;"
-                                            f"border-radius:999px;display:inline-block;margin-bottom:6px;'>{sl}</span>"
-                                            f"<div style='font-weight:600;font-size:13px;'>{abbr_currency(amt)}</div>"
-                                            f"<div style='color:#888;font-size:10px;'>Due: {dd}</div></div>",
-                                            unsafe_allow_html=True)
-                    gi += 1
-                st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
+                        ref   = format_invoice_number(str(r.get("ref_no", "—")).strip() or "—")
+                        vname = html.escape(str(r.get("vendor_name", "—")))
+                        amt   = safe_number(r.get("amount"))
+                        ddr   = r.get("due_date")
+                        dd    = pd.to_datetime(ddr).date().isoformat() if pd.notna(ddr) else "—"
+                        bk    = f"na_btn_{si2}_{gi}_{ref[:20]}"
 
-            st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
-            pc1, pc2, pc3 = st.columns([1,1,1], gap="small")
+                        with st.container(border=True):
+                            if st.button(ref, key=bk):
+                                # Set ALL state atomically — navigate in one rerun
+                                st.session_state["selected_invoice_detail"]   = str(ref).strip()
+                                st.session_state["page"]                      = "Invoices"
+                                st.session_state["invoice_search_from_card"]  = None
+                                st.session_state["invoice_search_input"]      = ""
+                                st.session_state["invoice_status_filter"]     = "All Status"
+                                st.session_state["inv_selected_vendor"]       = "All Vendors"
+                                st.rerun()
+                            st.markdown(
+                                f"<div style='text-align:right;margin-top:-24px;"
+                                f"font-size:11px;font-weight:700;color:{tc_color};'>"
+                                f"{sl}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown(
+                                f"<div style='text-align:right;'>"
+                                f"<div style='font-size:14px;font-weight:800;"
+                                f"color:#111827;line-height:1.2;'>{abbr_currency(amt)}</div>"
+                                f"<div style='font-size:10px;color:#9ca3af;'>"
+                                f"Due: {dd}</div></div>",
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown(
+                                f"<div style='font-size:11px;color:#6b7280;"
+                                f"margin-top:1px;'>{vname}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        gi += 1
+                st.markdown("<div style='height:4px;'></div>", unsafe_allow_html=True)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+            st.markdown("<div class='na-page-row'>", unsafe_allow_html=True)
+            pc1, pc2, pc3 = st.columns([1, 1, 1], gap="small")
             with pc1:
                 if page > 0:
                     if st.button("← Prev", key="na_prev", use_container_width=True):
-                        st.session_state.na_page = max(0, page-1); st.rerun()
+                        st.session_state.na_page = max(0, page - 1); st.rerun()
                 else:
-                    st.markdown("<div style='text-align:center;color:#d1d5db;padding:10px;'>← Prev</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        "<div style='text-align:center;color:#d1d5db;padding:8px;"
+                        "font-size:13px;'>← Prev</div>",
+                        unsafe_allow_html=True,
+                    )
             with pc2:
-                st.markdown(f"<div style='text-align:center;color:#6b7280;padding:10px;'>{page+1} of {tp}</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='na-page-info'>{page + 1} of {tp}</div>",
+                    unsafe_allow_html=True,
+                )
             with pc3:
-                if page < tp-1:
+                if page < tp - 1:
                     if st.button("Next →", key="na_next", use_container_width=True):
-                        st.session_state.na_page = min(tp-1, page+1); st.rerun()
+                        st.session_state.na_page = min(tp - 1, page + 1); st.rerun()
                 else:
-                    st.markdown("<div style='text-align:center;color:#d1d5db;padding:10px;'>Next →</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        "<div style='text-align:center;color:#d1d5db;padding:8px;"
+                        "font-size:13px;'>Next →</div>",
+                        unsafe_allow_html=True,
+                    )
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+def fetch_chart_data(start_lit: str, end_lit: str, vendor_where: str,
+                     end_lit_6m: str) -> tuple:
+    merged_sql = f"""
+        WITH
+        status_dist AS (
+            SELECT
+                CASE
+                    WHEN UPPER(invoice_status) IN ('PAID','CLEARED','CLOSED','POSTED','SETTLED') THEN 'Paid'
+                    WHEN UPPER(invoice_status) IN ('OPEN','PENDING','ON HOLD','PARKED','IN PROGRESS') THEN 'Pending'
+                    WHEN UPPER(invoice_status) IN ('DISPUTE','DISPUTED','BLOCKED','CONTESTED') THEN 'Disputed'
+                    ELSE 'Other'
+                END AS status,
+                COUNT(*) AS cnt,
+                'STATUS' AS _type
+            FROM {DATABASE}.fact_all_sources_vw
+            WHERE posting_date BETWEEN {start_lit} AND {end_lit}
+            GROUP BY 1
+        ),
+        top_vendors AS (
+            SELECT
+                COALESCE(v.vendor_name,'Unknown') AS vendor_name,
+                SUM(COALESCE(f.invoice_amount_local,0)) AS spend,
+                'VENDOR' AS _type
+            FROM {DATABASE}.fact_all_sources_vw f
+            LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id = v.vendor_id
+            WHERE f.posting_date BETWEEN {start_lit} AND {end_lit}
+            {vendor_where}
+            GROUP BY 1
+            ORDER BY spend DESC
+            LIMIT 10
+        ),
+        spend_trend AS (
+            SELECT
+                DATE_TRUNC('month', posting_date) AS month,
+                SUM(COALESCE(invoice_amount_local,0)) AS actual_spend,
+                'TREND' AS _type
+            FROM {DATABASE}.fact_all_sources_vw
+            WHERE posting_date >= {end_lit_6m}
+              AND UPPER(invoice_status) NOT IN ('CANCELLED','REJECTED')
+            GROUP BY 1
+            ORDER BY 1
+        )
+        SELECT CAST(status AS VARCHAR) AS col_a, CAST(cnt AS VARCHAR) AS col_b,
+               CAST(NULL AS VARCHAR) AS col_c, _type FROM status_dist
+        UNION ALL
+        SELECT vendor_name AS col_a, CAST(spend AS VARCHAR) AS col_b,
+               NULL AS col_c, _type FROM top_vendors
+        UNION ALL
+        SELECT CAST(month AS VARCHAR) AS col_a, CAST(actual_spend AS VARCHAR) AS col_b,
+               NULL AS col_c, _type FROM spend_trend
+    """
+    all_df = run_query(merged_sql)
+
+    if all_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    status_df = all_df[all_df["_type"] == "STATUS"][["col_a","col_b"]].copy()
+    status_df.columns = ["status","cnt"]
+    status_df["cnt"] = pd.to_numeric(status_df["cnt"], errors="coerce").fillna(0).astype(int)
+
+    vendor_df = all_df[all_df["_type"] == "VENDOR"][["col_a","col_b"]].copy()
+    vendor_df.columns = ["vendor_name","spend"]
+    vendor_df["spend"] = pd.to_numeric(vendor_df["spend"], errors="coerce").fillna(0)
+
+    trend_df = all_df[all_df["_type"] == "TREND"][["col_a","col_b"]].copy()
+    trend_df.columns = ["month","actual_spend"]
+    trend_df["actual_spend"] = pd.to_numeric(trend_df["actual_spend"], errors="coerce").fillna(0)
+
+    return status_df, vendor_df, trend_df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_chart_data_cached(start_lit: str, end_lit: str, vendor_where: str,
+                             end_lit_6m: str) -> tuple:
+    return fetch_chart_data(start_lit, end_lit, vendor_where, end_lit_6m)
+
 
 def render_charts(rng_start, rng_end, vendor_where):
-    sl = sql_date(rng_start); el = sql_date(rng_end)
+    start_lit   = sql_date(rng_start)
+    end_lit     = sql_date(rng_end)
+    end_lit_6m  = f"DATE_ADD('month', -6, {end_lit})"
+
+    status_df, vendor_df, trend_df = fetch_chart_data_cached(
+        start_lit, end_lit, vendor_where, end_lit_6m
+    )
+
     col1, col2, col3 = st.columns(3, gap="medium")
 
     with col1:
         with st.container(border=True):
-            st.markdown("<div class='chart-title'>Invoice Status Distribution</div>", unsafe_allow_html=True)
-            sdf = run_query(f"""
-                SELECT CASE
-                    WHEN UPPER(invoice_status) IN ('PAID','CLEARED','CLOSED','POSTED','SETTLED') THEN 'Paid'
-                    WHEN UPPER(invoice_status) IN ('OPEN','PENDING','ON HOLD','PARKED','IN PROGRESS') THEN 'Pending'
-                    WHEN UPPER(invoice_status) IN ('DISPUTE','DISPUTED','BLOCKED','CONTESTED') THEN 'Disputed'
-                    ELSE 'Other' END AS status, COUNT(*) AS cnt
-                FROM {DATABASE}.fact_all_sources_vw
-                WHERE posting_date BETWEEN {sl} AND {el} GROUP BY 1""")
-            if sdf.empty: sdf = pd.DataFrame([{"status":"Paid","cnt":450},{"status":"Pending","cnt":180},{"status":"Disputed","cnt":33},{"status":"Other","cnt":30}])
-            total = sdf["cnt"].sum(); sdf["percentage"] = (sdf["cnt"]/total*100).round(1)
-            cs = alt.Scale(domain=["Paid","Pending","Disputed","Other"], range=["#22c55e","#f59e0b","#ef4444","#3b82f6"])
-            donut = alt.Chart(sdf).mark_arc(innerRadius=50, outerRadius=90).encode(
-                theta=alt.Theta("cnt:Q"), color=alt.Color("status:N", scale=cs, legend=alt.Legend(orient="right",title=None,labelFontSize=11)),
-                tooltip=["status:N","cnt:Q","percentage:Q"]).properties(height=280)
-            ct = alt.Chart(pd.DataFrame({"t":[str(total)]})).mark_text(align="center",baseline="middle",fontSize=26,fontWeight="bold",color="#111827").encode(text="t:N")
-            cl = alt.Chart(pd.DataFrame({"t":["TOTAL"]})).mark_text(align="center",baseline="middle",fontSize=11,color="#6b7280",dy=18).encode(text="t:N")
-            st.altair_chart(donut+ct+cl, use_container_width=True)
+            st.markdown("<div class='chart-title'>Invoice Status Distribution</div>",
+                        unsafe_allow_html=True)
+            if status_df.empty:
+                status_df = pd.DataFrame([
+                    {"status":"Paid","cnt":450},{"status":"Pending","cnt":180},
+                    {"status":"Disputed","cnt":33},{"status":"Other","cnt":30}])
+            total = int(status_df["cnt"].sum())
+            status_df["percentage"] = (status_df["cnt"] / total * 100).round(1) if total > 0 else 0.0
+            status_df["pct_label"]  = status_df["percentage"].apply(lambda x: f"{x}%")
+
+            # Legend label includes status name only (percentage shown on slice)
+            cs = alt.Scale(
+                domain=["Paid","Pending","Disputed","Other"],
+                range=["#22c55e","#f59e0b","#ef4444","#3b82f6"]
+            )
+
+            base_chart = alt.Chart(status_df).encode(
+                theta=alt.Theta("cnt:Q", stack=True),
+                color=alt.Color(
+                    "status:N", scale=cs,
+                    legend=alt.Legend(
+                        orient="right", title=None,
+                        labelFontSize=12, symbolSize=100,
+                        labelLimit=100,
+                    )
+                ),
+            )
+
+            # Donut arcs — larger radius to match image
+            donut = base_chart.mark_arc(
+                innerRadius=55, outerRadius=95,
+                stroke="white", strokeWidth=2
+            ).encode(
+                tooltip=[
+                    alt.Tooltip("status:N", title="Status"),
+                    alt.Tooltip("cnt:Q",    title="Count"),
+                    alt.Tooltip("pct_label:N", title="Share"),
+                ]
+            )
+
+            # Percentage labels on slices — only show if >= 3%
+            pct_labels = base_chart.transform_filter(
+                alt.datum.percentage >= 3
+            ).mark_text(
+                radius=115, fontSize=11, fontWeight="bold", color="#1f2937"
+            ).encode(
+                text=alt.Text("pct_label:N")
+            )
+
+            # Centre: total number
+            ct = alt.Chart(pd.DataFrame({"t": [str(total)]})).mark_text(
+                align="center", baseline="middle",
+                fontSize=26, fontWeight="bold", color="#111827"
+            ).encode(text="t:N")
+
+            # Centre: TOTAL label below number
+            cl = alt.Chart(pd.DataFrame({"t": ["TOTAL"]})).mark_text(
+                align="center", baseline="middle",
+                fontSize=10, color="#6b7280", dy=18
+            ).encode(text="t:N")
+
+            st.altair_chart(
+                (donut + pct_labels + ct + cl).properties(height=280),
+                use_container_width=True,
+            )
 
     with col2:
         with st.container(border=True):
-            st.markdown("<div class='chart-title'>Top 10 Vendors by Spend</div>", unsafe_allow_html=True)
-            tdf = run_query(f"""
-                SELECT v.vendor_name, SUM(COALESCE(f.invoice_amount_local,0)) AS spend
-                FROM {DATABASE}.fact_all_sources_vw f
-                LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
-                WHERE f.posting_date BETWEEN {sl} AND {el} {vendor_where}
-                GROUP BY 1 ORDER BY spend DESC LIMIT 10""")
-            if tdf.empty: tdf = pd.DataFrame([{"vendor_name":"No Data","spend":0}])
-            st.altair_chart(alt.Chart(tdf).mark_bar(color="#22c55e",cornerRadiusEnd=4).encode(
-                x=alt.X("spend:Q",title=None,axis=alt.Axis(format="~s")),
-                y=alt.Y("vendor_name:N",sort="-x",title=None),
-                tooltip=["vendor_name:N",alt.Tooltip("spend:Q",format="$,.0f")]).properties(height=280), use_container_width=True)
+            st.markdown("<div class='chart-title'>Top 10 Vendors by Spend</div>",
+                        unsafe_allow_html=True)
+            if vendor_df.empty:
+                vendor_df = pd.DataFrame([{"vendor_name":"No Data","spend":0}])
+            st.altair_chart(
+                alt.Chart(vendor_df).mark_bar(color="#22c55e", cornerRadiusEnd=4).encode(
+                    x=alt.X("spend:Q", title=None, axis=alt.Axis(format="~s")),
+                    y=alt.Y("vendor_name:N", sort="-x", title=None),
+                    tooltip=["vendor_name:N", alt.Tooltip("spend:Q", format="$,.0f")]
+                ).properties(height=280),
+                use_container_width=True,
+            )
 
     with col3:
         with st.container(border=True):
-            st.markdown("<div class='chart-title'>Spend Trend Analysis</div>", unsafe_allow_html=True)
-            trdf = run_query(f"""
-                SELECT DATE_TRUNC('month',posting_date) AS month,
-                       SUM(COALESCE(invoice_amount_local,0)) AS actual_spend
-                FROM {DATABASE}.fact_all_sources_vw
-                WHERE posting_date >= DATE_ADD('month',-6,{el})
-                  AND UPPER(invoice_status) NOT IN ('CANCELLED','REJECTED')
-                GROUP BY 1 ORDER BY 1""")
-            if trdf.empty:
-                trdf = pd.DataFrame([{"month":"2026-01","actual_spend":0,"forecast_spend":0}])
+            st.markdown("<div class='chart-title'>Spend Trend Analysis</div>",
+                        unsafe_allow_html=True)
+            if trend_df.empty:
+                trend_df = pd.DataFrame([{"month":"2026-01","actual_spend":0,"forecast_spend":0}])
             else:
-                trdf["month"] = pd.to_datetime(trdf["month"]).dt.strftime("%Y-%m")
-                trdf["forecast_spend"] = trdf["actual_spend"].rolling(2,min_periods=1).mean().shift(-1).fillna(trdf["actual_spend"]*1.1)
-            melted = trdf.melt(id_vars=["month"],value_vars=["actual_spend","forecast_spend"],var_name="type",value_name="spend")
+                trend_df["month"] = pd.to_datetime(trend_df["month"]).dt.strftime("%Y-%m")
+                trend_df["forecast_spend"] = (
+                    trend_df["actual_spend"].rolling(2, min_periods=1).mean()
+                    .shift(-1).fillna(trend_df["actual_spend"] * 1.1)
+                )
+            melted = trend_df.melt(
+                id_vars=["month"], value_vars=["actual_spend","forecast_spend"],
+                var_name="type", value_name="spend"
+            )
             melted["type"] = melted["type"].map({"actual_spend":"ACTUAL","forecast_spend":"FORECAST"})
-            st.altair_chart(alt.Chart(melted).mark_bar(cornerRadiusEnd=4).encode(
-                x=alt.X("month:N",title=None,axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("spend:Q",title=None,axis=alt.Axis(format="~s")),
-                color=alt.Color("type:N",scale=alt.Scale(domain=["ACTUAL","FORECAST"],range=["#22c55e","#3b82f6"]),legend=alt.Legend(orient="top",title=None)),
-                xOffset="type:N", tooltip=["month:N","type:N",alt.Tooltip("spend:Q",format="$,.0f")]).properties(height=280), use_container_width=True)
+            st.altair_chart(
+                alt.Chart(melted).mark_bar(cornerRadiusEnd=4).encode(
+                    x=alt.X("month:N", title=None, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("spend:Q", title=None, axis=alt.Axis(format="~s")),
+                    color=alt.Color("type:N",
+                        scale=alt.Scale(domain=["ACTUAL","FORECAST"],
+                                        range=["#22c55e","#3b82f6"]),
+                        legend=alt.Legend(orient="top", title=None)),
+                    xOffset="type:N",
+                    tooltip=["month:N","type:N", alt.Tooltip("spend:Q", format="$,.0f")]
+                ).properties(height=280),
+                use_container_width=True,
+            )
+
+
 
 def render_dashboard():
-    # ── Initialise session state keys (only on first load) ────
     for k, v in [
-        ("date_range",       compute_range_preset("Last 30 Days")),
-        ("selected_vendor",  "All Vendors"),
-        ("preset",           "Last 30 Days"),
-        ("na_tab",           "Overdue"),
-        ("na_page",          0),
-        ("_preset_clicked",  False),
+        ("date_range",      compute_range_preset("Last 30 Days")),
+        ("selected_vendor", "All Vendors"),
+        ("preset",          "Last 30 Days"),
+        ("na_tab",          "Overdue"),
+        ("na_page",         0),
+        ("_preset_clicked", False),
     ]:
         if k not in st.session_state:
             st.session_state[k] = v
 
-    # ── Remove any stale date-keyed vendor cache entries ─────
-    # Old code stored keys like "vendor_list_2026-01-01_2026-06-11".
-    # These cause ghost list instances that feed a second selectbox.
-    # Safe to delete — _load_vendor_list() rebuilds under the stable key.
-    stale_keys = [k for k in list(st.session_state.keys())
-                  if isinstance(k, str) and k.startswith("vendor_list_") and k != "vendor_list_stable"]
-    for k in stale_keys:
+    stale = [k for k in list(st.session_state.keys())
+             if isinstance(k, str) and k.startswith("vendor_list_") and k != "vendor_list_stable"]
+    for k in stale:
         del st.session_state[k]
 
     rng_start, rng_end, selected_vendor = render_filters()
     vendor_where = build_vendor_where(selected_vendor)
-    sl = sql_date(rng_start); el = sql_date(rng_end)
+    sl  = sql_date(rng_start);  el  = sql_date(rng_end)
     ps, pe = prior_window(rng_start, rng_end)
 
-    with st.spinner("Loading KPIs..."):
-        cur_kpi  = fetch_kpi_data(sl, el, vendor_where, rng_start.isoformat(), rng_end.isoformat())
-        prev_kpi = fetch_kpi_data(sql_date(ps), sql_date(pe), vendor_where, ps.isoformat(), pe.isoformat())
+    # ── Cache key: only re-fetch when filters actually change ────────────────
+    _kpi_cache_key = f"_kpi_{sl}_{el}_{vendor_where}_{sql_date(ps)}_{sql_date(pe)}"
+    try:
+        if _kpi_cache_key not in st.session_state:
+            cur_kpi  = fetch_kpi_data(sl, el, vendor_where,
+                                       rng_start.isoformat(), rng_end.isoformat())
+            prev_kpi = fetch_kpi_data(sql_date(ps), sql_date(pe), vendor_where,
+                                       ps.isoformat(), pe.isoformat())
+            st.session_state[_kpi_cache_key] = (cur_kpi, prev_kpi)
+            # Clear old cache keys to save memory
+            for _old_k in [k for k in list(st.session_state.keys())
+                           if k.startswith("_kpi_") and k != _kpi_cache_key]:
+                del st.session_state[_old_k]
+        else:
+            cur_kpi, prev_kpi = st.session_state[_kpi_cache_key]
+    except Exception as _e:
+        st.error(f"Failed to load KPI data: {_e}")
+        cur_kpi  = {"total_spend": 0, "active_pos": 0, "total_pos": 0,
+                    "pending_inv": 0, "active_vendors": 0,
+                    "avg_processing_days": 0.0, "first_pass_rate": 0.0, "auto_rate": 0.0}
+        prev_kpi = cur_kpi.copy()
+
+    save_kpi_snapshot(
+        st.session_state.get("preset","Custom"),
+        rng_start.isoformat(), rng_end.isoformat(), cur_kpi
+    )
+    preset_now = st.session_state.get("preset","Last 30 Days")
+    if preset_now != "Custom":
+        set_user_memory("preferred_preset", preset_now, "preference", "inferred", 0.9)
 
     st.markdown("<div style='height:0.5rem;'></div>", unsafe_allow_html=True)
     render_kpi_rows(cur_kpi, prev_kpi)
-    st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
     render_needs_attention(rng_start, rng_end, vendor_where)
+
     st.markdown("<div style='height:1rem;'></div>", unsafe_allow_html=True)
     render_charts(rng_start, rng_end, vendor_where)
 
+
 # ── Forecast ─────────────────────────────────────────────────
 def render_forecast():
-    cf_sql = f"""SELECT forecast_bucket,invoice_count,total_amount,earliest_due,latest_due
-        FROM {DATABASE}.cash_flow_forecast_vw
-        ORDER BY CASE forecast_bucket WHEN 'TOTAL_UNPAID' THEN 0 WHEN 'OVERDUE_NOW' THEN 1
-            WHEN 'DUE_7_DAYS' THEN 2 WHEN 'DUE_14_DAYS' THEN 3 WHEN 'DUE_30_DAYS' THEN 4
-            WHEN 'DUE_60_DAYS' THEN 5 WHEN 'DUE_90_DAYS' THEN 6 WHEN 'BEYOND_90_DAYS' THEN 7 ELSE 8 END"""
-    cf_df = run_query(cf_sql)
+    if "forecast_cf_df" not in st.session_state:
+        st.session_state.forecast_cf_df = None
+    if st.session_state.forecast_cf_df is None:
+        cf_sql = f"""SELECT forecast_bucket,invoice_count,total_amount,earliest_due,latest_due
+            FROM {DATABASE}.cash_flow_forecast_vw
+            ORDER BY CASE forecast_bucket WHEN 'TOTAL_UNPAID' THEN 0 WHEN 'OVERDUE_NOW' THEN 1
+                WHEN 'DUE_7_DAYS' THEN 2 WHEN 'DUE_14_DAYS' THEN 3 WHEN 'DUE_30_DAYS' THEN 4
+                WHEN 'DUE_60_DAYS' THEN 5 WHEN 'DUE_90_DAYS' THEN 6 WHEN 'BEYOND_90_DAYS' THEN 7 ELSE 8 END"""
+        st.session_state.forecast_cf_df = run_query(cf_sql)
+    cf_df = st.session_state.forecast_cf_df
     if cf_df.empty:
         st.warning("cash_flow_forecast_vw empty – computing from fact table.")
         cf_sql = f"""WITH base AS (
@@ -1153,17 +1747,42 @@ def render_forecast():
         for i,col in enumerate(cols):
             with col:
                 st.markdown(f'<div class="fkc" style="background:{kc[i]};"><div class="fkt">{kt[i]}</div><div class="fkv">{kv[i]}</div></div>',unsafe_allow_html=True)
-        st.markdown("---"); st.markdown("#### Obligations by time bucket")
+        st.markdown("---")
+        st.markdown("#### Obligations by time bucket")
         if not cf_df.empty:
-            st.dataframe(safe_dataframe_display(cf_df),use_container_width=True,hide_index=True)
-            st.download_button("Download forecast (CSV)",data=cf_df.to_csv(index=False).encode(),file_name="cash_flow_forecast.csv",mime="text/csv")
-        else: st.info("No cash flow forecast data.")
+            display_df = cf_df.copy()
+            bucket_labels = {
+                "TOTAL_UNPAID": "Total Unpaid",
+                "OVERDUE_NOW": "Overdue Now",
+                "DUE_7_DAYS": "Due in 7 Days",
+                "DUE_14_DAYS": "Due in 14 Days",
+                "DUE_30_DAYS": "Due in 30 Days",
+                "DUE_60_DAYS": "Due in 60 Days",
+                "DUE_90_DAYS": "Due in 90 Days",
+                "BEYOND_90_DAYS": "Beyond 90 Days",
+            }
+            if "forecast_bucket" in display_df.columns:
+                display_df["forecast_bucket"] = display_df["forecast_bucket"].map(
+                    lambda x: bucket_labels.get(str(x).upper(), x)
+                )
+            render_simple_table(display_df, col_labels={
+                "forecast_bucket": "Time Bucket",
+                "invoice_count":   "Invoice Count",
+                "total_amount":    "Total Amount ($)",
+                "earliest_due":    "Earliest Due",
+                "latest_due":      "Latest Due",
+            })
+            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+            st.download_button("Download forecast (CSV)", data=cf_df.to_csv(index=False).encode(),
+                               file_name="cash_flow_forecast.csv", mime="text/csv")
+        else:
+            st.info("No cash flow forecast data.")
         st.markdown("---"); st.markdown("### Action Playbook")
         for label,question in [
-            ("📊 Forecast cash outflow (7–90 days)","Forecast cash outflow for the next 7, 14, 30, 60, and 90 days"),
-            ("💰 Invoices to pay early to capture discounts","Which invoices should we pay early to capture discounts?"),
-            ("⏰ Optimal payment timing for this week","What is the optimal payment timing strategy for this week?"),
-            ("⚠️ Late payment trend and risk","Show late payment trend for forecasting")]:
+            ("Forecast cash outflow (7-90 days)","Forecast cash outflow for the next 7, 14, 30, 60, and 90 days"),
+            ("Invoices to pay early to capture discounts","Which invoices should we pay early to capture discounts?"),
+            ("Optimal payment timing for this week","What is the optimal payment timing strategy for this week?"),
+            ("Late payment trend and risk","Show late payment trend for forecasting")]:
             if st.button(label,use_container_width=True):
                 st.session_state.auto_run_query=question; st.session_state.page="Genie"; st.rerun()
 
@@ -1190,8 +1809,14 @@ def render_forecast():
         trdf=run_query(trsql)
         if not trdf.empty:
             st.markdown("**GR/IR outstanding trend (last 24 months)**")
-            st.dataframe(safe_dataframe_display(trdf),use_container_width=True,hide_index=True)
-        else: st.info("No GR/IR data.")
+            render_simple_table(trdf, col_labels={
+                "year":            "Year",
+                "month":           "Month",
+                "invoice_count":   "Invoice Count",
+                "total_grir_blnc": "Total GR/IR Balance ($)",
+            })
+        else:
+            st.info("No GR/IR data.")
         st.markdown("---"); st.markdown("### GR/IR Clearing Playbook")
         for label,question in [
             ("1. Identify top GR/IR hotspots","Show GR/IR outstanding balance by month and highlight which recent months have the highest GR/IR balance so we can prioritize clearing."),
@@ -1253,13 +1878,8 @@ OUT_OF_DOMAIN_MSG = ("Hello! I am ProcureIQ Assistant. I can help you with procu
     "and related business data. Please ask a procurement or dashboard-related question.")
 
 def is_relevant_question(q: str) -> bool:
-    """
-    Strict whitelist-only: ONLY returns True when procurement keywords are present.
-    Any greeting, small talk, or general knowledge question returns False immediately.
-    """
     ql = q.lower().strip()
 
-    # Step 1: Hard-block non-procurement patterns
     non_proc_patterns = [
         r"^(hi|hello|hey|howdy|hiya|yo)\b",
         r"^good\s*(morning|afternoon|evening|night|day)\b",
@@ -1287,7 +1907,6 @@ def is_relevant_question(q: str) -> bool:
         if re.search(pat, ql):
             return False
 
-    # Step 2: Strict procurement keyword whitelist — MUST match at least one
     procurement_keywords = [
         "spend","vendor","invoice","invoices","purchase order","payment","payments",
         "due date","overdue","dispute","disputed","gr/ir","grir","gr ir",
@@ -1304,26 +1923,22 @@ def is_relevant_question(q: str) -> bool:
         if kw in ql:
             return True
 
-    # Nothing matched → not a procurement question
     return False
 
 def generate_sql(question: str) -> str:
-    """Generate SQL via Bedrock. Returns empty string if generation fails (no hardcoded fallback)."""
     sql = ask_bedrock(f"Question: {question}\n\nGenerate SQL.", SYS_SEMANTIC)
     if sql:
         sql = re.sub(r"```sql\s*","",sql); sql = re.sub(r"```\s*","",sql).strip()
         if not sql.lower().startswith("select"): sql=""
-    return sql  # Empty string if Bedrock couldn't generate — caller handles this
+    return sql
 
 SYS_ANALYST = "You are a helpful senior procurement analyst. Respond in markdown with Descriptive (What the data shows) and Prescriptive (Recommendations) sections."
 
 def process_custom_query(query: str, history: str="") -> dict:
-    # ALWAYS check relevance first — this is the primary gate
     if not is_relevant_question(query):
         return {"layout":"static","analyst_response":OUT_OF_DOMAIN_MSG,"question":query}
     sql = generate_sql(query)
     if not sql or not is_safe_sql(sql):
-        # If SQL generation failed, still try to give a helpful answer via Bedrock text
         txt = ask_bedrock(
             f'{history}\nUser asked: "{query}"\nNo SQL was generated. Provide a general procurement answer.',
             SYS_ANALYST)
@@ -1674,14 +2289,6 @@ GRIR_WC_Q        = "Estimate the working capital that would be released by clear
 GRIR_FOLLOWUP_Q  = "Based on GR/IR aging and outstanding balances, draft vendor-facing follow-up templates we can use for high-priority GR/IR items, with realistic subject lines and concise bullet points."
 
 def _dispatch_query(q: str, history: str) -> dict:
-    """
-    Central dispatcher for all Genie queries.
-    FIRST gate: is_relevant_question() — if the question is not procurement-related,
-    return the standard out-of-domain message immediately, before any SQL or LLM call.
-    Hard-coded quick-analysis labels ("Spending Overview" etc.) bypass the relevance
-    check because they are internal system triggers, not user free-text.
-    """
-    # ── Internal quick-analysis triggers (system labels — bypass relevance check) ──
     if q == GRIR_HOTSPOTS_Q:  return process_grir_hotspots(q, history)
     if q == GRIR_ROOTCAUSE_Q: return process_grir_root_causes(q, history)
     if q == GRIR_WC_Q:        return process_grir_working_capital(q, history)
@@ -1691,13 +2298,9 @@ def _dispatch_query(q: str, history: str) -> dict:
     if q == "Payment Performance":  return _quick_payment_performance()
     if q == "Invoice Aging":        return _quick_invoice_aging()
 
-    # ── RELEVANCE GATE — must pass before any LLM or Athena call ──────────────
-    # This is the definitive check. If it returns False, no SQL is generated,
-    # no Bedrock call is made, no data is returned — only the default message.
     if not is_relevant_question(q):
         return {"layout": "static", "analyst_response": OUT_OF_DOMAIN_MSG, "question": q}
 
-    # ── Procurement-confirmed: route to appropriate handler ───────────────────
     lq = q.lower()
     if any(kw in lq for kw in ["forecast cash outflow", "cash flow forecast"]):
         return process_cash_flow_forecast(q, history)
@@ -1708,13 +2311,10 @@ def _dispatch_query(q: str, history: str) -> dict:
     if "late payment trend" in lq:
         return process_late_payment_trend(q, history)
 
-    # Default: generate SQL from free-text question
     return process_custom_query(q, history)
 
 def process_user_question(user_question: str):
     with st.spinner("Generating insights..."):
-        # Skip cache entirely for out-of-domain questions
-        # (avoids serving stale procurement responses for greetings)
         if not is_relevant_question(user_question):
             result = {"layout": "static", "analyst_response": OUT_OF_DOMAIN_MSG, "question": user_question}
             st.session_state.current_messages = [
@@ -1725,42 +2325,59 @@ def process_user_question(user_question: str):
             st.rerun()
             return
 
-        cached=get_cache(user_question)
+        cached = get_cache_with_ttl(user_question, cache_type="genie")
         if cached:
             st.session_state.current_messages=[
                 {"role":"user","content":user_question,"timestamp":datetime.now()},
-                {"role":"assistant","content":cached.get('analyst_response',''),"response":cached,"timestamp":datetime.now()}]
+                {"role":"assistant","content":cached.get('analyst_response',''),
+                 "response":cached,"timestamp":datetime.now()}]
             save_chat_message(st.session_state.genie_session_id,0,"user",user_question)
-            save_chat_message(st.session_state.genie_session_id,1,"assistant",cached.get('analyst_response',''),source="cache",sql_used=_safe_sql_string(cached.get("sql")))
+            save_chat_message(st.session_state.genie_session_id,1,"assistant",
+                              cached.get('analyst_response',''),source="cache",
+                              sql_used=_safe_sql_string(cached.get("sql")))
             save_question(user_question,"custom")
         else:
-            history=get_recent_conversation_context(limit=20,max_age_days=2)
-            result=_dispatch_query(user_question,history)
+            history = build_bedrock_context(
+                st.session_state.genie_session_id, max_turns=6
+            )
+            result = _dispatch_query(user_question, history)
             st.session_state.current_messages=[{"role":"user","content":user_question,"timestamp":datetime.now()}]
             if result.get("layout")!="error":
                 ac=result.get('analyst_response','Analysis complete.')
                 st.session_state.current_messages.append({"role":"assistant","content":ac,"response":result,"timestamp":datetime.now()})
-                set_cache(user_question,result)
+                set_cache_with_ttl(user_question, result, cache_type="genie", ttl_seconds=3600)
                 save_chat_message(st.session_state.genie_session_id,0,"user",user_question)
-                save_chat_message(st.session_state.genie_session_id,1,"assistant",ac,sql_used=_safe_sql_string(result.get("sql")))
+                save_chat_message(st.session_state.genie_session_id,1,"assistant",ac,
+                                  sql_used=_safe_sql_string(result.get("sql")))
                 save_question(user_question,"forecast")
+                infer_and_save_preferences(user_question, result)
             else:
                 st.session_state.current_messages.append({"role":"assistant","content":result.get("message","Error"),"timestamp":datetime.now()})
     st.rerun()
 
 def start_new_session():
-    st.session_state.genie_session_id=str(uuid.uuid4())
-    st.session_state.current_messages=[]; st.session_state.show_summary=False; st.session_state.conversation_summary=""
-    save_chat_session(st.session_state.genie_session_id,label=f"New Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    st.session_state.genie_session_id = str(uuid.uuid4())
+    st.session_state.current_messages = []
+    st.session_state.show_summary = False
+    st.session_state.conversation_summary = ""
+    st.session_state["show_chats_panel"] = False
+    save_chat_session(st.session_state.genie_session_id,
+                      label=f"New Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     st.rerun()
 
 def summarize_conversation():
-    if not st.session_state.current_messages: st.warning("No conversation."); return
-    txt="\n\n".join(f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}" for m in st.session_state.current_messages)
-    s=ask_bedrock(f"Summarize concisely:\n\n{txt}","You summarize conversations.")
+    if not st.session_state.current_messages:
+        return
+    txt = "\n\n".join(
+        f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}"
+        for m in st.session_state.current_messages
+    )
+    s = ask_bedrock(f"Summarize concisely:\n\n{txt}", "You summarize conversations.")
     if s:
-        st.session_state.conversation_summary=s; st.session_state.show_summary=True; st.session_state.current_messages=[]
-    else: st.error("Could not generate summary.")
+        st.session_state.conversation_summary = s
+        st.session_state.show_summary = True
+    else:
+        st.error("Could not generate summary.")
 
 def export_conversation_md():
     if not st.session_state.current_messages and not st.session_state.get("conversation_summary"):
@@ -1774,143 +2391,1077 @@ def export_conversation_md():
         file_name=f"genie_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",mime="text/markdown",key="export_md_btn")
 
 def render_genie():
-    for k,v in [("genie_session_id",None),("current_messages",[]),("genie_prefill",""),("show_summary",False),("conversation_summary","")]:
-        if k not in st.session_state: st.session_state[k]=v
-    if st.session_state.genie_session_id is None:
-        st.session_state.genie_session_id=str(uuid.uuid4())
-        save_chat_session(st.session_state.genie_session_id,label=f"New Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    # ── Form CSS — matches reference code: clean input + Send button ──
+    st.markdown("""
+<style>
+/* Form wrapper: transparent, no border */
+div[data-testid="stForm"] {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    margin-top: 8px !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+}
+div[data-testid="stForm"] > div[data-testid="stVerticalBlock"] {
+    padding: 0 !important;
+    gap: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"] {
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    width: 100% !important;
+    flex-wrap: nowrap !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:first-child {
+    flex: 1 1 0% !important;
+    min-width: 0 !important;
+    padding: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:last-child {
+    flex: 0 0 52px !important;
+    width: 52px !important;
+    min-width: 52px !important;
+    padding: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] {
+    width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] > div {
+    width: 100% !important;
+    padding: 0 !important;
+}
+/* Input: white, rounded, no heavy border */
+div[data-testid="stForm"] div[data-testid="stTextInput"] input {
+    width: 100% !important;
+    height: 48px !important;
+    min-height: 48px !important;
+    border: 1.5px solid #e2e8f0 !important;
+    border-radius: 12px !important;
+    font-size: 14px !important;
+    color: #374151 !important;
+    background: white !important;
+    padding: 0 18px !important;
+    box-shadow: none !important;
+    outline: none !important;
+    box-sizing: border-box !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] input:focus {
+    border-color: #d1d5db !important;
+    background: white !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] input::placeholder {
+    color: #9ca3af !important;
+    font-size: 14px !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] label {
+    display: none !important;
+}
+/* Submit button: square rounded, white bg, dark arrow — matches screenshot exactly */
+div[data-testid="stForm"] button[kind="primaryFormSubmit"],
+div[data-testid="stForm"] button[data-testid="baseButton-primary"] {
+    width: 48px !important;
+    height: 48px !important;
+    min-height: 48px !important;
+    min-width: 48px !important;
+    border-radius: 12px !important;
+    padding: 0 !important;
+    font-size: 18px !important;
+    font-weight: 600 !important;
+    background: white !important;
+    color: #111827 !important;
+    border: 1.5px solid #e2e8f0 !important;
+    box-shadow: none !important;
+    line-height: 48px !important;
+    text-align: center !important;
+    cursor: pointer !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+div[data-testid="stForm"] button[kind="primaryFormSubmit"]:hover,
+div[data-testid="stForm"] button[data-testid="baseButton-primary"]:hover {
+    background: #f9fafb !important;
+    border-color: #9ca3af !important;
+    color: #111827 !important;
+    box-shadow: none !important;
+    transform: none !important;
+}
 
-    auto_query=st.session_state.pop("auto_run_query",None)
+/* Kill red focus ring globally */
+div[data-baseweb="input"] { border: none !important; box-shadow: none !important; }
+div[data-baseweb="input"]:focus-within { border: none !important; box-shadow: none !important; }
+input:focus { outline: none !important; }
+</style>
+""", unsafe_allow_html=True)
+
+    # ── Session state init ────────────────────────────────────────────────────
+    for k, v in [("genie_session_id", None), ("current_messages", []),
+                 ("genie_prefill", ""), ("show_summary", False),
+                 ("conversation_summary", ""), ("show_chats_panel", False),
+                 ("genie_input_version", 0)]:
+        if k not in st.session_state:
+            st.session_state[k] = v
+    if st.session_state.genie_session_id is None:
+        st.session_state.genie_session_id = str(uuid.uuid4())
+        save_chat_session(st.session_state.genie_session_id,
+                          label=f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+    # ── Auto-run query ────────────────────────────────────────────────────────
+    auto_query = st.session_state.pop("auto_run_query", None)
     if auto_query:
         with st.spinner("Running analysis..."):
-            hc=get_recent_conversation_context(limit=20,max_age_days=2)
-            result=_dispatch_query(auto_query,hc)
-            st.session_state.current_messages=[{"role":"user","content":auto_query,"timestamp":datetime.now()}]
-            if result.get("layout")!="error":
-                ac=result.get('analyst_response','Analysis complete.')
-                st.session_state.current_messages.append({"role":"assistant","content":ac,"response":result,"timestamp":datetime.now()})
-                save_chat_message(st.session_state.genie_session_id,0,"user",auto_query)
-                save_chat_message(st.session_state.genie_session_id,1,"assistant",ac,sql_used=_safe_sql_string(result.get("sql")))
-                save_question(auto_query,"forecast"); set_cache(auto_query,result)
+            hc = get_recent_conversation_context(limit=20, max_age_days=2)
+            result = _dispatch_query(auto_query, hc)
+            st.session_state.current_messages = [
+                {"role": "user", "content": auto_query, "timestamp": datetime.now()}
+            ]
+            if result.get("layout") != "error":
+                ac = result.get("analyst_response", "Analysis complete.")
+                st.session_state.current_messages.append(
+                    {"role": "assistant", "content": ac, "response": result,
+                     "timestamp": datetime.now()}
+                )
+                save_chat_message(st.session_state.genie_session_id, 0, "user", auto_query)
+                save_chat_message(st.session_state.genie_session_id, 1, "assistant", ac,
+                                  sql_used=_safe_sql_string(result.get("sql")))
+                save_question(auto_query, "forecast")
+                set_cache(auto_query, result)
             else:
-                st.session_state.current_messages.append({"role":"assistant","content":result.get("message","Error"),"timestamp":datetime.now()})
-            st.rerun()
+                st.session_state.current_messages.append(
+                    {"role": "assistant", "content": result.get("message", "Error"),
+                     "timestamp": datetime.now()}
+                )
+        st.rerun()
 
-    st.markdown("""<div style="margin-bottom:1rem;">
-        <h1 style="font-size:1.8rem;font-weight:600;color:#1e293b;margin-bottom:0.25rem;">Welcome to ProcureIQ Genie</h1>
-        <p style="color:#64748b;font-size:0.9rem;">Let Genie run one of these quick analyses for you</p></div>""",
-        unsafe_allow_html=True)
+    # ── All page CSS ──────────────────────────────────────────────────────────
+    st.markdown("""
+<style>
+.genie-welcome h1 {
+    font-size: 1.75rem; font-weight: 700; color: #1e293b; margin-bottom: 4px;
+}
+.genie-welcome p { font-size: 0.9rem; color: #64748b; margin: 0; }
 
-    cards=[{"icon":"📊","title":"Spending Overview","desc":"Track total spend, monthly trends and major changes"},
-           {"icon":"🏭","title":"Vendor Analysis","desc":"Understand vendor-wise spend, concentration, and dependency"},
-           {"icon":"⏱️","title":"Payment Performance","desc":"Identify delays, late payments, and cycle time issues"},
-           {"icon":"📅","title":"Invoice Aging","desc":"See overdue invoices, risk buckets, and problem areas"}]
-    cols=st.columns(4,gap="small")
-    for idx,(col,card) in enumerate(zip(cols,cards)):
+/* ── Quick-analysis cards — matching screenshot exactly ── */
+.genie-card {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    padding: 20px 18px 14px 18px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    display: flex;
+    flex-direction: column;
+    min-height: 158px;
+}
+.genie-card-icon {
+    width: 46px;
+    height: 46px;
+    border-radius: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 13px;
+    flex-shrink: 0;
+}
+.genie-card-title {
+    font-size: 0.93rem;
+    font-weight: 700;
+    color: #111827;
+    margin: 0 0 5px 0;
+    line-height: 1.3;
+}
+.genie-card-desc {
+    font-size: 0.77rem;
+    color: #6b7280;
+    line-height: 1.45;
+    flex-grow: 1;
+    margin: 0 0 12px 0;
+}
+
+/* Ensure left panel container aligns with AI Assistant container */
+div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child
+  > div[data-testid="stVerticalBlock"]
+  > div[data-testid="stVerticalBlockBorderWrapper"] {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}
+/* Input inside ask question container — full width */
+div[data-testid="stForm"] div[data-testid="stTextInput"] input {
+    width: 100% !important;
+}
+
+.genie-left-panel div[data-testid="stExpander"] {
+    border: none !important;
+    border-bottom: 1px solid #f1f5f9 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+}
+.genie-left-panel div[data-testid="stExpander"] summary {
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    color: #374151 !important;
+    padding: 8px 4px !important;
+}
+.genie-left-panel button {
+    text-align: left !important;
+    justify-content: flex-start !important;
+    background: transparent !important;
+    border: none !important;
+    color: #374151 !important;
+    font-size: 12.5px !important;
+    padding: 4px 6px !important;
+    height: auto !important;
+    min-height: 28px !important;
+    box-shadow: none !important;
+    font-weight: 400 !important;
+}
+.genie-left-panel button:hover {
+    background: #f1f5f9 !important;
+    color: #2563eb !important;
+    border: none !important;
+}
+.genie-right-container {
+    background: white;
+    border: 1.5px solid #e2e8f0;
+    border-radius: 16px;
+    padding: 14px 16px 12px 16px;
+    box-shadow: 0 1px 8px rgba(0,0,0,0.06);
+}
+button[data-testid="baseButton-secondary"][aria-label="Chats"],
+button[data-testid="baseButton-primary"][aria-label="Chats"],
+button[data-testid="baseButton-secondary"][aria-label="Summarize"],
+button[data-testid="baseButton-primary"][aria-label="Summarize"],
+button[data-testid="baseButton-secondary"][aria-label="Export MD"] {
+    margin-right: 6px !important;
+}
+button[data-testid="baseButton-secondary"][aria-label="Export MD"],
+button[data-testid="baseButton-secondary"][aria-label="Clear"] {
+    height: 38px !important;
+    min-height: 38px !important;
+    border-radius: 999px !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    white-space: nowrap !important;
+    padding: 0 18px !important;
+    border: 1.5px solid #d1d5db !important;
+    background: white !important;
+    color: #374151 !important;
+    box-shadow: none !important;
+}
+button[data-testid="baseButton-secondary"][aria-label="Chats"]:hover,
+button[data-testid="baseButton-secondary"][aria-label="Summarize"]:hover,
+button[data-testid="baseButton-secondary"][aria-label="Export MD"]:hover,
+button[data-testid="baseButton-secondary"][aria-label="Clear"]:hover {
+    border-color: #2563eb !important;
+    color: #2563eb !important;
+    background: #f0f7ff !important;
+}
+button[data-testid="baseButton-primary"][aria-label="Chats"],
+button[data-testid="baseButton-primary"][aria-label="Summarize"] {
+    background: #2563eb !important;
+    color: white !important;
+    border-color: #2563eb !important;
+    box-shadow: 0 2px 8px rgba(37,99,235,0.25) !important;
+}
+.genie-empty {
+    background: #f8fafc; border-radius: 12px;
+    padding: 2.2rem 1rem; text-align: center;
+    margin: 8px 0 6px 0; min-height: 200px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+}
+.genie-empty-icon  { font-size: 1.8rem; color: #cbd5e1; margin-bottom: 8px; }
+.genie-empty-title { font-size: 0.98rem; font-weight: 600; color: #1e293b; margin-bottom: 4px; }
+.genie-empty-sub   { font-size: 0.8rem; color: #94a3b8; max-width: 240px; line-height: 1.4; }
+.chat-messages {
+    max-height: 360px; overflow-y: auto; padding: 4px 2px;
+    margin-bottom: 6px; background: #fafcff;
+    border-radius: 10px; border: 1px solid #e8edf3;
+}
+.resume-panel {
+    background: #f0f7ff; border-radius: 10px; padding: 10px 12px;
+    border: 1px solid #bfdbfe; margin: 4px 0 8px 0;
+}
+div[data-testid="stForm"] {
+    background: white !important;
+    border: 1.5px solid #e2e8f0 !important;
+    border-radius: 14px !important;
+    padding: 8px 12px !important;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.06) !important;
+    margin-top: 8px !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+}
+div[data-testid="stForm"] > div[data-testid="stVerticalBlock"] {
+    padding: 0 !important;
+    gap: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"] {
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    width: 100% !important;
+    flex-wrap: nowrap !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:first-child {
+    flex: 1 1 0% !important;
+    min-width: 0 !important;
+    width: 0 !important;
+    padding: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:last-child {
+    flex: 0 0 52px !important;
+    width: 52px !important;
+    min-width: 52px !important;
+    padding: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] {
+    width: 100% !important; padding: 0 !important; margin: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] > div {
+    width: 100% !important; padding: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] input {
+    width: 100% !important;
+    height: 48px !important;
+    min-height: 48px !important;
+    border: 1.5px solid #e2e8f0 !important;
+    border-radius: 12px !important;
+    font-size: 14px !important;
+    color: #374151 !important;
+    background: white !important;
+    padding: 0 18px !important;
+    box-shadow: none !important;
+    outline: none !important;
+    box-sizing: border-box !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] input:focus {
+    border-color: #d1d5db !important;
+    background: white !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] input::placeholder {
+    color: #9ca3af !important;
+    font-size: 14px !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] label {
+    display: none !important;
+}
+/* Square rounded button — white bg, dark arrow, matches screenshot */
+div[data-testid="stForm"] button[kind="primaryFormSubmit"],
+div[data-testid="stForm"] button[data-testid="baseButton-primary"] {
+    width: 48px !important;
+    height: 48px !important;
+    min-height: 48px !important;
+    min-width: 48px !important;
+    border-radius: 12px !important;
+    padding: 0 !important;
+    font-size: 18px !important;
+    font-weight: 600 !important;
+    background: white !important;
+    color: #111827 !important;
+    border: 1.5px solid #e2e8f0 !important;
+    box-shadow: none !important;
+    line-height: 48px !important;
+    text-align: center !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+div[data-testid="stForm"] button[kind="primaryFormSubmit"]:hover,
+div[data-testid="stForm"] button[data-testid="baseButton-primary"]:hover {
+    background: #f9fafb !important;
+    border-color: #9ca3af !important;
+    color: #111827 !important;
+    box-shadow: none !important;
+    transform: none !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 1 — Title + Quick-analysis cards (UPDATED to match screenshot)
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("""
+<div class="genie-welcome">
+  <h1>Welcome to ProcureSpendIQ Genie</h1>
+  <p>Let Genie run one of these quick analyses for you</p>
+</div>""", unsafe_allow_html=True)
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+
+    # Card data — SVG icons on colored square backgrounds, matching screenshot style
+    card_data = [
+        {
+            "title": "Spending Overview",
+            "icon_svg": (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" '
+                'fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+                '<line x1="18" y1="20" x2="18" y2="10"/>'
+                '<line x1="12" y1="20" x2="12" y2="4"/>'
+                '<line x1="6" y1="20" x2="6" y2="14"/>'
+                '</svg>'
+            ),
+            "icon_bg": "#6366F1",
+            "desc": "Track total spend, monthly trends and major changes",
+        },
+        {
+            "title": "Vendor Analysis",
+            "icon_svg": (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" '
+                'fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+                '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'
+                '<polyline points="9 22 9 12 15 12 15 22"/>'
+                '</svg>'
+            ),
+            "icon_bg": "#6366F1",
+            "desc": "Understand vendor-wise spend, concentration, and dependency",
+        },
+        {
+            "title": "Payment Performance",
+            "icon_svg": (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" '
+                'fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+                '<circle cx="12" cy="12" r="10"/>'
+                '<polyline points="12 6 12 12 16 14"/>'
+                '</svg>'
+            ),
+            "icon_bg": "#6366F1",
+            "desc": "Identify delays, late payments, and cycle time issues",
+        },
+        {
+            "title": "Invoice Aging",
+            "icon_svg": (
+                '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" '
+                'fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+                '<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>'
+                '<line x1="16" y1="2" x2="16" y2="6"/>'
+                '<line x1="8" y1="2" x2="8" y2="6"/>'
+                '<line x1="3" y1="10" x2="21" y2="10"/>'
+                '</svg>'
+            ),
+            "icon_bg": "#6366F1",
+            "desc": "See overdue invoices, risk buckets, and problem areas",
+        },
+    ]
+
+    # CSS: card wraps button too — negative margin pulls button inside card border
+    st.markdown("""
+<style>
+/* Card container — uses st.container so button renders inside */
+div[data-testid="stVerticalBlockBorderWrapper"].genie-card-wrap {
+    border: 1px solid #e5e7eb !important;
+    border-radius: 14px !important;
+    padding: 20px 18px 14px 18px !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06) !important;
+    background: white !important;
+}
+/* Button inside genie card: grey pill, full width, sits at bottom */
+div.genie-card-wrap button {
+    background: white !important;
+    border: 1px solid #d1d5db !important;
+    border-radius: 8px !important;
+    color: #374151 !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    height: 36px !important;
+    min-height: 36px !important;
+    margin-top: 10px !important;
+    box-shadow: none !important;
+    width: 100% !important;
+}
+div.genie-card-wrap button:hover {
+    border-color: #2563eb !important;
+    color: #2563eb !important;
+    background: #f0f7ff !important;
+    box-shadow: none !important;
+    transform: none !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+    card_cols = st.columns(4, gap="small")
+    for idx, (col, card) in enumerate(zip(card_cols, card_data)):
         with col:
-            st.markdown(f'<div class="quick-card"><div style="font-size:2rem;">{card["icon"]}</div>'
-                        f'<h3>{card["title"]}</h3><p>{card["desc"]}</p></div>',unsafe_allow_html=True)
-            if st.button("Ask Genie",key=f"card_{idx}",use_container_width=True):
-                st.session_state.auto_run_query=card['title']; st.rerun()
+            # Icon + title + desc rendered as HTML
+            st.markdown(
+                f"<div style='background:white;border:1px solid #e5e7eb;border-radius:14px;"
+                f"padding:20px 18px 14px 18px;box-shadow:0 1px 4px rgba(0,0,0,0.06);"
+                f"display:flex;flex-direction:column;min-height:158px;'>"
+                f"<div style='width:46px;height:46px;border-radius:11px;"
+                f"background:{card['icon_bg']};display:flex;align-items:center;"
+                f"justify-content:center;margin-bottom:13px;flex-shrink:0;'>"
+                f"{card['icon_svg']}"
+                f"</div>"
+                f"<div style='font-size:0.93rem;font-weight:700;color:#111827;"
+                f"margin:0 0 5px 0;line-height:1.3;'>{card['title']}</div>"
+                f"<div style='font-size:0.77rem;color:#6b7280;line-height:1.45;"
+                f"margin:0 0 8px 0;'>{card['desc']}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            # Ask Genie button below the card
+            if st.button("Ask Genie", key=f"card_{idx}", use_container_width=True):
+                st.session_state.auto_run_query = card["title"]
+                st.rerun()
 
-    st.markdown("---")
-    left_info,right_chat=st.columns([0.35,0.65],gap="large")
+    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
 
-    with left_info:
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Left panel + Right AI Assistant panel
+    # ══════════════════════════════════════════════════════════════════════════
+    left_col, right_col = st.columns([0.32, 0.68], gap="medium")
+
+    # ── LEFT PANEL ────────────────────────────────────────────────────────────
+    with left_col:
         with st.container(border=True):
-            with st.expander("Saved insights"):
-                ins=get_saved_insights_cached(page="genie")
+            with st.expander("Saved Insights"):
+                ins = get_saved_insights_cached(page="genie")
                 if ins:
-                    for i in ins[:5]:
-                        if st.button(f"› {i['title'][:40]}",key=f"insight_{i['id']}",use_container_width=True):
-                            st.session_state.auto_run_query=i["question"]; st.rerun()
-                else: st.caption("No saved insights yet")
-            with st.expander("Frequently asked by you"):
-                faqs=get_frequent_questions_by_user_cached(5)
+                    for i2 in ins[:5]:
+                        if st.button(i2["title"][:45], key=f"insight_{i2['id']}",
+                                     use_container_width=True):
+                            st.session_state.auto_run_query = i2["question"]
+                            st.rerun()
+                else:
+                    st.caption("No saved insights yet")
+
+            with st.expander("Frequently Asked by You"):
+                faqs = get_frequent_questions_by_user_cached(5)
                 if faqs:
                     for faq in faqs[:5]:
-                        if st.button(f"› {faq['query'][:40]}",key=f"faq_{faq['query'][:20]}",use_container_width=True):
-                            st.session_state.genie_prefill=faq["query"]; st.rerun()
+                        if st.button(faq["query"][:45], key=f"faq_{faq['query'][:20]}",
+                                     use_container_width=True):
+                            st.session_state.genie_prefill = faq["query"]
+                            st.rerun()
                 else:
-                    for sug in ["Total spend YTD and trends","Top vendors by spend","Overdue invoices summary"]:
-                        if st.button(f"› {sug}",key=f"sug_{sug[:15]}",use_container_width=True):
-                            st.session_state.genie_prefill=sug; st.rerun()
-            with st.expander("Most frequent (all)"):
-                af=get_frequent_questions_all_cached(5)
+                    for sug in ["Total spend YTD and trends",
+                                "Top vendors by spend",
+                                "Overdue invoices summary"]:
+                        if st.button(sug, key=f"sug_{sug[:15]}", use_container_width=True):
+                            st.session_state.genie_prefill = sug
+                            st.rerun()
+
+            with st.expander("Most Frequent (All)"):
+                af = get_frequent_questions_all_cached(5)
                 if af:
                     for faq in af[:5]:
-                        st.markdown(f"<div style='color:#64748b;font-size:0.85rem;'>› {faq['query'][:40]}</div>",unsafe_allow_html=True)
-                else: st.caption("No questions yet")
+                        st.markdown(
+                            f"<div style='text-align:left;color:#374151;"
+                            f"font-size:0.83rem;padding:3px 0;cursor:default;'>"
+                            f"{faq['query'][:45]}</div>",
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.caption("No questions yet")
 
-    with right_chat:
+
+    # ── RIGHT PANEL — AI Assistant ────────────────────────────────────────────
+    with right_col:
         with st.container(border=True):
-            bc1,bc2,bc3=st.columns(3)
-            with bc1:
-                if st.button("Export MD",use_container_width=True,key="export_md_top"):
-                    if st.session_state.current_messages or st.session_state.conversation_summary: export_conversation_md()
-                    else: st.warning("No conversation to export.")
-            with bc2:
-                if st.button("Summarize",use_container_width=True,key="summarize_top"):
-                    if st.session_state.current_messages: summarize_conversation(); st.rerun()
-                    else: st.warning("No conversation to summarize.")
-            with bc3:
-                if st.button("Clear",use_container_width=True,key="clear_top"): start_new_session()
+            st.markdown("""
+<style>
+/* AI Assistant header buttons — white rounded rectangles, matching screenshot */
+    button[aria-label="Chats"],
+    button[aria-label="Summarize"],
+    button[aria-label="Export MD"],
+    button[aria-label="Clear"] {
+            height: 40px !important;
+            min-height: 40px !important;
+            border-radius: 10px !important;
+            font-size: 13px !important;
+            font-weight: 500 !important;
+            white-space: nowrap !important;
+            padding: 0 16px !important;
+            border: 1.5px solid #d1d5db !important;
+            background: white !important;
+            color: #374151 !important;
+            box-shadow: none !important;
+            width: 100% !important;
+    }
+    button[aria-label="Chats"]:hover,
+    button[aria-label="Summarize"]:hover,
+    button[aria-label="Export MD"]:hover,
+    button[aria-label="Clear"]:hover {
+            border-color: #9ca3af !important;
+            color: #111827 !important;
+            background: #f9fafb !important;
+            box-shadow: none !important;
+            transform: none !important;
+    }
+    button[kind="primary"][aria-label="Chats"],
+    button[kind="primary"][aria-label="Summarize"] {
+            background: #f3f4f6 !important;
+            color: #111827 !important;
+            border-color: #d1d5db !important;
+            font-weight: 600 !important;
+            box-shadow: none !important;
+    }
+    /* Empty state container */
+    .genie-empty {
+            background: #f1f5f9 !important;
+            border-radius: 16px !important;
+            padding: 3rem 2rem !important;
+            text-align: center !important;
+            margin: 12px 0 !important;
+            min-height: 220px !important;
+            display: flex !important;
+            flex-direction: column !important;
+            align-items: center !important;
+            justify-content: center !important;
+    }
+    .genie-empty-icon {
+            font-size: 1.6rem !important;
+            color: #94a3b8 !important;
+            margin-bottom: 10px !important;
+            font-weight: 200 !important;
+    }
+    .genie-empty-title {
+            font-size: 1rem !important;
+            font-weight: 700 !important;
+            color: #1e293b !important;
+            margin-bottom: 6px !important;
+    }
+    .genie-empty-sub {
+            font-size: 0.82rem !important;
+            color: #94a3b8 !important;
+            max-width: 220px !important;
+            line-height: 1.5 !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
+            c_title, cb1, cb2, cb3, cb4 = st.columns([1.1, 0.72, 0.88, 0.88, 0.65])
+            with c_title:
+                st.markdown(
+                    "<div style='display:flex;align-items:center;height:38px;'>"
+                    "<b style='font-size:1rem;color:#1e293b;'>AI Assistant</b></div>",
+                    unsafe_allow_html=True,
+                )
+            with cb1:
+                chats_on = st.session_state.get("show_chats_panel", False)
+                if st.button("Chats", key="genie_chats_btn",
+                             use_container_width=True,
+                             type="primary" if chats_on else "secondary"):
+                    st.session_state["show_chats_panel"] = not chats_on
+                    st.rerun()
+            with cb2:
+                sum_active = (st.session_state.get("show_summary", False)
+                              and bool(st.session_state.get("conversation_summary", "")))
+                if st.button("Summarize", key="summarize_top",
+                             use_container_width=True,
+                             type="primary" if sum_active else "secondary"):
+                    if st.session_state.current_messages:
+                        if sum_active:
+                            st.session_state.show_summary = False
+                            st.session_state.conversation_summary = ""
+                        else:
+                            summarize_conversation()
+                        st.rerun()
+                    elif sum_active:
+                        st.session_state.show_summary = False
+                        st.session_state.conversation_summary = ""
+                        st.rerun()
+            with cb3:
+                if st.button("Export MD", key="export_md_top",
+                             use_container_width=True):
+                    if st.session_state.current_messages or st.session_state.conversation_summary:
+                        export_conversation_md()
+            with cb4:
+                if st.button("Clear", key="clear_top",
+                             use_container_width=True):
+                    st.session_state.current_messages = []
+                    st.session_state.show_summary = False
+                    st.session_state.conversation_summary = ""
+                    st.session_state["show_chats_panel"] = False
+                    st.rerun()
+
+            st.markdown("<hr style='margin:6px 0 8px 0;border:none;"
+                        "border-top:1px solid #f1f5f9;'/>", unsafe_allow_html=True)
+
+            # ── Chats panel ───────────────────────────────────────────────────
+            if st.session_state.get("show_chats_panel", False):
+                conn_c = sqlite3.connect(DB_PATH); cur_c = conn_c.cursor()
+                cur_c.execute("""SELECT session_id, session_label, created_at
+                                 FROM chat_sessions WHERE user_name=?
+                                 ORDER BY last_updated DESC LIMIT 10""",
+                              (get_current_user(),))
+                recent = cur_c.fetchall(); session_data = []
+                for sess in recent:
+                    cur_c.execute("SELECT COUNT(*) FROM chat_messages WHERE session_id=?",
+                                  (sess[0],))
+                    mc = cur_c.fetchone()[0]
+                    if mc > 0:
+                        session_data.append({"session_id": sess[0], "label": sess[1],
+                                             "created_at": sess[2], "msg_count": mc})
+                conn_c.close()
+
+                st.markdown("""<div class="resume-panel">
+                    <b>Resume a Previous Conversation</b><br>
+                    <small style='color:#64748b;'>Pick one to continue, or start fresh.</small>
+                </div>""", unsafe_allow_html=True)
+
+                if session_data:
+                    for sess in session_data[:5]:
+                        try:
+                            dt = datetime.fromisoformat(str(sess["created_at"]))
+                            age_h = int((datetime.now() - dt).total_seconds() / 3600)
+                            age_s = f"{age_h}h ago" if age_h < 24 else f"{age_h // 24}d ago"
+                        except Exception:
+                            age_s = "–"
+                        ri, rb = st.columns([0.7, 0.3])
+                        with ri:
+                            st.markdown(
+                                f"<div style='font-size:.82rem;font-weight:600;"
+                                f"color:#1e293b;'>{sess['label']}</div>"
+                                f"<div style='font-size:.72rem;color:#94a3b8;'>"
+                                f"{sess['msg_count']} messages · {age_s}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with rb:
+                            if st.button("Resume", key=f"res_{sess['session_id'][:8]}",
+                                         use_container_width=True, type="primary"):
+                                msgs_r = load_session_messages(sess["session_id"])
+                                st.session_state.genie_session_id = sess["session_id"]
+                                st.session_state.current_messages = [
+                                    {"role": m["role"], "content": m["content"],
+                                     "timestamp": m["timestamp"]} for m in msgs_r
+                                ]
+                                st.session_state["show_chats_panel"] = False
+                                st.rerun()
+                        st.markdown("<div style='height:3px;'></div>", unsafe_allow_html=True)
+                else:
+                    st.caption("No previous conversations.")
+
+                if st.button("Start a New Conversation", key="start_new_conv",
+                             use_container_width=True):
+                    st.session_state.current_messages = []
+                    st.session_state.show_summary = False
+                    st.session_state.conversation_summary = ""
+                    st.session_state["show_chats_panel"] = False
+                    st.rerun()
+                st.markdown("<hr style='margin:6px 0;'/>", unsafe_allow_html=True)
+
+            # ── Summary ───────────────────────────────────────────────────────
             if st.session_state.show_summary and st.session_state.conversation_summary:
-                st.markdown("### Conversation Summary"); st.markdown(st.session_state.conversation_summary)
-                if st.button("Dismiss Summary",key="dismiss_summary",use_container_width=True):
-                    st.session_state.show_summary=False; st.session_state.conversation_summary=""; st.rerun()
+                st.markdown("**Conversation Summary**")
+                st.markdown(st.session_state.conversation_summary)
+                if st.button("Dismiss", key="dismiss_summary", use_container_width=True):
+                    st.session_state.show_summary = False
+                    st.session_state.conversation_summary = ""
+                    st.session_state.current_messages = []
+                    st.session_state["show_chats_panel"] = False
+                    st.rerun()
                 st.markdown("---")
-            elif not st.session_state.current_messages:
-                st.markdown("""<div class="start-conversation">
-                    <div style="font-size:3rem;margin-bottom:0.5rem;">+</div>
-                    <div style="font-size:1.1rem;font-weight:600;color:#1e293b;">Start a Conversation</div>
-                    <div style="color:#64748b;font-size:0.85rem;max-width:280px;margin:0.5rem auto;">
-                        Ask questions about your Procurement to Pay data.</div></div>""",unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="chat-messages">',unsafe_allow_html=True)
-                for msg in st.session_state.current_messages:
-                    if msg["role"]=="user":
-                        st.markdown(f'<div class="message-user"><strong>You</strong><br/>{html.escape(msg["content"])}</div>',unsafe_allow_html=True)
-                    else:
-                        st.markdown('<div class="message-assistant"><strong>Genie</strong></div>',unsafe_allow_html=True)
-                        if "response" in msg and msg["response"]:
-                            resp=msg["response"]; layout=resp.get("layout")
-                            if layout=="static": st.info(resp["analyst_response"])
-                            elif layout=="cash_flow": render_cash_flow_response(resp)
-                            elif layout=="early_payment": render_early_payment_response(resp)
-                            elif layout=="payment_timing": render_payment_timing_response(resp)
-                            elif layout=="late_payment_trend": render_late_payment_trend_response(resp)
-                            elif layout=="grir_hotspots": render_grir_hotspots(resp)
-                            elif layout=="grir_root_causes": render_grir_root_causes(resp)
-                            elif layout=="grir_working_capital": render_grir_working_capital(resp)
-                            elif layout=="grir_vendor_followup": render_grir_vendor_followup(resp)
-                            elif layout=="quick": render_quick_analysis_response(resp)
-                            elif layout=="analyst":
-                                if resp.get("analyst_response"): st.markdown(resp["analyst_response"])
-                                df=pd.DataFrame(resp["df"])
-                                if not df.empty:
-                                    st.subheader("Supporting Data")
-                                    st.dataframe(safe_dataframe_display(df),use_container_width=True,hide_index=True)
-                                    ch=auto_chart(df)
-                                    if ch: st.altair_chart(ch,use_container_width=True)
-                                with st.expander("View SQL"): st.code(_safe_sql_string(resp.get("sql")),language="sql")
-                            elif layout=="error": st.error(resp.get("message","Unknown error"))
-                        else: st.markdown(msg["content"])
-                st.markdown('</div>',unsafe_allow_html=True)
 
-            with st.form(key="genie_chat_form",clear_on_submit=True):
-                ci,cb=st.columns([0.85,0.15])
-                with ci:
-                    prefill=st.session_state.pop("genie_prefill","")
-                    uq=st.text_input("Ask a question",value=prefill,placeholder="Ask a procurement question here...",label_visibility="collapsed")
-                with cb:
-                    submitted=st.form_submit_button("→",type="primary",use_container_width=True)
-                if submitted and uq: process_user_question(uq)
+            # ── Empty state — matches screenshot: centered icon, bold title, subtitle ──
+            elif (not st.session_state.current_messages
+                  and not st.session_state.get("show_chats_panel", False)):
+                st.markdown("""
+    <div style="text-align:center;padding:3rem 1rem 2.5rem 1rem;background:transparent;">
+      <div style="width:52px;height:52px;border-radius:50%;background:#e2e8f0;
+              display:flex;align-items:center;justify-content:center;
+              margin:0 auto 1.2rem auto;font-size:1.4rem;color:#94a3b8;font-weight:300;
+              line-height:52px;">+</div>
+      <div style="font-size:1.15rem;font-weight:700;color:#111827;margin-bottom:0.6rem;">
+              Start a Conversation</div>
+      <div style="font-size:0.85rem;color:#6b7280;line-height:1.6;
+              max-width:280px;margin:0 auto;">
+              Ask questions about your Procurement to Pay data, or<br/>
+              select a pre-built analysis from the library.</div>
+    </div>""", unsafe_allow_html=True)
+
+            # ── Chat messages ─────────────────────────────────────────────────
+            elif st.session_state.current_messages:
+                for msg in st.session_state.current_messages:
+                    if msg["role"] == "user":
+                        st.markdown(
+                            f'<div class="message-user"><strong>You</strong><br/>'
+                            f'{html.escape(msg["content"])}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(
+                            '<div class="message-assistant"><strong>Genie</strong></div>',
+                            unsafe_allow_html=True,
+                        )
+                        if "response" in msg and msg["response"]:
+                            resp = msg["response"]
+                            layout = resp.get("layout")
+                            if layout == "static":
+                                st.info(resp["analyst_response"])
+                            elif layout == "cash_flow":
+                                render_cash_flow_response(resp)
+                            elif layout == "early_payment":
+                                render_early_payment_response(resp)
+                            elif layout == "payment_timing":
+                                render_payment_timing_response(resp)
+                            elif layout == "late_payment_trend":
+                                render_late_payment_trend_response(resp)
+                            elif layout == "grir_hotspots":
+                                render_grir_hotspots(resp)
+                            elif layout == "grir_root_causes":
+                                render_grir_root_causes(resp)
+                            elif layout == "grir_working_capital":
+                                render_grir_working_capital(resp)
+                            elif layout == "grir_vendor_followup":
+                                render_grir_vendor_followup(resp)
+                            elif layout == "quick":
+                                render_quick_analysis_response(resp)
+                            elif layout == "analyst":
+                                if resp.get("analyst_response"):
+                                    st.markdown(resp["analyst_response"])
+                                try:
+                                    raw_df = resp.get("df", [])
+                                    if isinstance(raw_df, list) and len(raw_df) > 0:
+                                        df_r = pd.DataFrame(raw_df)
+                                    elif isinstance(raw_df, dict):
+                                        df_r = pd.DataFrame([raw_df])
+                                    else:
+                                        df_r = pd.DataFrame()
+                                except Exception:
+                                    df_r = pd.DataFrame()
+                                if not df_r.empty:
+                                    st.markdown("**Supporting Data**")
+                                    st.dataframe(
+                                        safe_dataframe_display(df_r),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+                                    ch_r = auto_chart(df_r)
+                                    if ch_r:
+                                        st.altair_chart(ch_r, use_container_width=True)
+                                sql_s = _safe_sql_string(resp.get("sql", ""))
+                                if sql_s and sql_s.strip():
+                                    with st.expander("View SQL"):
+                                        st.code(sql_s, language="sql")
+                            elif layout == "error":
+                                st.error(resp.get("message", "Unknown error"))
+                        else:
+                            st.markdown(msg["content"])
+
+
+    # ── Ask a question — same width as AI Assistant container ────────────────
+    _spacer_col, ask_col = st.columns([0.32, 0.68], gap="medium")
+    with ask_col:
+        st.markdown("""
+<style>
+div[data-testid="stForm"] {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+}
+div[data-testid="stForm"] > div[data-testid="stVerticalBlock"] {
+    padding: 0 !important; gap: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"] {
+    display: flex !important; align-items: center !important;
+    gap: 8px !important; width: 100% !important;
+    flex-wrap: nowrap !important; padding: 0 !important; margin: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:first-child {
+    flex: 1 1 auto !important; min-width: 0 !important; width: 100% !important; padding: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:last-child {
+    flex: 0 0 90px !important; width: 90px !important;
+    min-width: 90px !important; max-width: 90px !important; padding: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"],
+div[data-testid="stForm"] div[data-testid="stTextInput"] > div,
+div[data-testid="stForm"] div[data-testid="stTextInput"] > div > div,
+div[data-testid="stForm"] div[data-testid="stTextInput"] > div > div > div {
+    width: 100% !important; padding: 0 !important; margin: 0 !important;
+}
+div[data-testid="stForm"] div[data-baseweb="base-input"],
+div[data-testid="stForm"] div[data-baseweb="base-input"] input {
+    width: 100% !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] input,
+div[data-testid="stForm"] div[data-testid="stTextInput"] input:focus,
+div[data-testid="stForm"] div[data-testid="stTextInput"] input:active,
+div[data-testid="stForm"] div[data-testid="stTextInput"] input:hover {
+    width: 100% !important; min-width: 100% !important;
+    height: 46px !important; min-height: 46px !important;
+    border: 1.5px solid #e2e8f0 !important;
+    border-radius: 10px !important;
+    font-size: 14px !important; color: #374151 !important;
+    background: #ffffff !important;
+    padding: 0 16px !important;
+    box-shadow: none !important; outline: none !important;
+    -webkit-box-shadow: none !important; box-sizing: border-box !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] input::placeholder {
+    color: #9ca3af !important; font-size: 14px !important;
+}
+div[data-testid="stForm"] div[data-testid="stTextInput"] label { display: none !important; }
+div[data-testid="stForm"] div[data-baseweb="input"],
+div[data-testid="stForm"] div[data-baseweb="input"]:focus-within {
+    border: none !important; box-shadow: none !important;
+    outline: none !important; background: transparent !important;
+}
+div[data-testid="stForm"] button[kind="primaryFormSubmit"],
+div[data-testid="stForm"] button[data-testid="baseButton-primary"] {
+    width: 100% !important; height: 46px !important; min-height: 46px !important;
+    border-radius: 10px !important; padding: 0 14px !important;
+    font-size: 14px !important; font-weight: 600 !important;
+    background: #2563eb !important; color: white !important;
+    border: 1.5px solid #2563eb !important;
+    box-shadow: 0 2px 8px rgba(37,99,235,0.25) !important;
+    cursor: pointer !important; display: inline-flex !important;
+    align-items: center !important; justify-content: center !important;
+    white-space: nowrap !important;
+}
+div[data-testid="stForm"] button[kind="primaryFormSubmit"]:hover,
+div[data-testid="stForm"] button[data-testid="baseButton-primary"]:hover {
+    background: #1d4ed8 !important; border-color: #1d4ed8 !important;
+    color: white !important; box-shadow: 0 4px 12px rgba(37,99,235,0.4) !important;
+    transform: translateY(-1px) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+        with st.container(border=True):
+            # CSS: force input to fill all space, button fixed right
+            st.markdown("""
+<style>
+/* Make the form row a proper flex container */
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"] {
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    width: 100% !important;
+    flex-wrap: nowrap !important;
+}
+/* Input column: take ALL remaining space */
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:first-child {
+    flex: 1 1 auto !important;
+    width: 100% !important;
+    min-width: 0 !important;
+}
+/* All nested wrappers inside input col must be 100% */
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:first-child * {
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+}
+/* The actual input element */
+div[data-testid="stForm"] input[type="text"],
+div[data-testid="stForm"] input {
+    width: 100% !important;
+    min-width: 100% !important;
+    height: 48px !important;
+    min-height: 48px !important;
+    border: 1.5px solid #e2e8f0 !important;
+    border-radius: 10px !important;
+    font-size: 15px !important;
+    color: #374151 !important;
+    background: #ffffff !important;
+    padding: 0 18px !important;
+    box-shadow: none !important;
+    outline: none !important;
+    box-sizing: border-box !important;
+}
+div[data-testid="stForm"] input::placeholder {
+    color: #9ca3af !important;
+    font-size: 15px !important;
+}
+/* Button column: fixed narrow, INSIDE the container */
+div[data-testid="stForm"] div[data-testid="stHorizontalBlock"]
+  > div[data-testid="column"]:last-child {
+    flex: 0 0 100px !important;
+    width: 100px !important;
+    min-width: 100px !important;
+    max-width: 100px !important;
+}
+/* Send button — blue default and blue on hover/click */
+div[data-testid="stForm"] button[kind="primaryFormSubmit"] {
+    width: 100% !important;
+    height: 48px !important;
+    border-radius: 10px !important;
+    font-size: 14px !important;
+    font-weight: 600 !important;
+    background: #2563eb !important;
+    background-color: #2563eb !important;
+    color: white !important;
+    border: 1.5px solid #2563eb !important;
+    box-shadow: 0 2px 8px rgba(37,99,235,0.25) !important;
+    cursor: pointer !important;
+}
+div[data-testid="stForm"] button[kind="primaryFormSubmit"]:hover,
+div[data-testid="stForm"] button[kind="primaryFormSubmit"]:active,
+div[data-testid="stForm"] button[kind="primaryFormSubmit"]:focus,
+div[data-testid="stForm"] button[kind="primaryFormSubmit"]:focus-visible {
+    background: #1d4ed8 !important;
+    background-color: #1d4ed8 !important;
+    border-color: #1d4ed8 !important;
+    color: white !important;
+    box-shadow: 0 4px 12px rgba(37,99,235,0.4) !important;
+    transform: translateY(-1px) !important;
+}
+div[data-testid="stForm"] label { display: none !important; }
+/* Form wrapper: no extra bg or border */
+div[data-testid="stForm"] {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+}
+div[data-testid="stForm"] > div[data-testid="stVerticalBlock"] {
+    padding: 0 !important;
+    gap: 0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+            with st.form("genie_question_form", clear_on_submit=True):
+                input_col, btn_col = st.columns([0.82, 0.18])
+                with input_col:
+                    user_query = st.text_input(
+                        "q",
+                        placeholder="Ask a question here...",
+                        label_visibility="collapsed",
+                        key=f"genie_chat_input_{st.session_state.get('genie_input_version', 0)}"
+                    )
+                with btn_col:
+                    send_clicked = st.form_submit_button("Send →", use_container_width=True)
+
+            if send_clicked and user_query and user_query.strip():
+                st.session_state.selected_analysis = "custom"
+                st.session_state.last_custom_query = user_query.strip()
+                st.session_state.show_analysis = True
+                st.session_state["genie_input_version"] = st.session_state.get("genie_input_version", 0) + 1
+                with st.spinner("Analyzing..."):
+                    process_user_question(user_query.strip())
+
+
+
 
 
 # ── Invoices ──────────────────────────────────────────────────
-def render_invoice_detail(inv_row: dict, inv_num: str):
+def render_invoice_detail(inv_row: dict, inv_num: str, show_pay_button: bool = False):
     def gv(key,default=""):
         val=inv_row.get(key,default)
         try:
@@ -1927,7 +3478,7 @@ def render_invoice_detail(inv_row: dict, inv_num: str):
 
     st.markdown(f"""<div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
         border-radius:12px;padding:16px 20px;margin-bottom:24px;box-shadow:0 4px 12px rgba(0,0,0,0.1);">
-        <div style="color:white;font-size:1.1rem;font-weight:600;">🔍 Genie Insights</div>
+        <div style="color:white;font-size:1.1rem;font-weight:600;">Genie Insights</div>
         <div style="color:#f0f0f0;margin-top:6px;">Recommend immediate review of invoice
         <strong>{inv_num}</strong> — outstanding for <strong>{aging_days}</strong> days.</div></div>""",unsafe_allow_html=True)
 
@@ -1944,10 +3495,13 @@ def render_invoice_detail(inv_row: dict, inv_num: str):
     st.markdown(ht,unsafe_allow_html=True)
 
     st.markdown("---"); st.markdown("### Status History")
-    hsql=f"""SELECT UPPER(status) AS status,effective_date,status_notes
-        FROM {DATABASE}.invoice_status_history_vw
-        WHERE CAST(invoice_number AS VARCHAR)='{inv_num}' ORDER BY sequence_nbr"""
-    hdf=run_query(hsql)
+    hist_key = f"inv_hist_{inv_num}"
+    if hist_key not in st.session_state:
+        hsql=f"""SELECT UPPER(status) AS status,effective_date,status_notes
+            FROM {DATABASE}.invoice_status_history_vw
+            WHERE CAST(invoice_number AS VARCHAR)='{inv_num}' ORDER BY sequence_nbr"""
+        st.session_state[hist_key] = run_query(hsql)
+    hdf = st.session_state[hist_key].copy()
     if hdf.empty:
         hdf=pd.DataFrame([{"status":"OPEN","effective_date":gv("invoice_date",""),"status_notes":"Invoice opened."},
                           {"status":"OVERDUE","effective_date":gv("due_date",""),"status_notes":"Invoice overdue."}])
@@ -1958,7 +3512,14 @@ def render_invoice_detail(inv_row: dict, inv_num: str):
     if st.session_state.get(pk,False) and "PAID" not in hdf["status"].values:
         hdf=pd.concat([hdf,pd.DataFrame([{"status":"PAID","effective_date":date.today().strftime("%Y-%m-%d"),"status_notes":"Processed via ProcureIQ"}])],ignore_index=True)
     hdf["effective_date"]=hdf["effective_date"].apply(lambda x: x.strftime("%Y-%m-%d") if isinstance(x,(date,datetime)) else str(x))
-    st.dataframe(safe_dataframe_display(hdf[["status","effective_date","status_notes"]]),use_container_width=True,hide_index=True)
+    render_simple_table(
+        hdf[["status", "effective_date", "status_notes"]],
+        col_labels={
+            "status":         "Status",
+            "effective_date": "Effective Date",
+            "status_notes":   "Notes",
+        }
+    )
 
     st.markdown("---"); st.markdown("### Vendor & Company Information")
     t1,t2=st.tabs(["Vendor Info","Company Info"])
@@ -1992,52 +3553,120 @@ def render_invoice_detail(inv_row: dict, inv_num: str):
         st.markdown(ht,unsafe_allow_html=True)
 
     st.markdown("---")
-    cs=gv("invoice_status","").upper()
-    if st.session_state.get(pk,False): st.success("✅ Invoice has been processed and marked as Paid.")
-    elif cs=="PAID": st.info("ℹ️ This invoice is already marked as PAID.")
-    else:
-        if st.button("✅ Proceed to Pay",key="proceed_pay_btn",use_container_width=True):
-            st.session_state[pk]=True; st.rerun()
+    cs = gv("invoice_status", "").upper()
+    if show_pay_button:
+        if st.session_state.get(pk, False):
+            st.success("✅ Invoice has been processed and marked as Paid.")
+        elif cs in ("PAID", "CLEARED", "CLOSED", "SETTLED"):
+            st.info("ℹ️ This invoice is already marked as PAID.")
+        else:
+            if st.button("✅ Proceed to Pay", key="proceed_pay_btn",
+                         use_container_width=True):
+                st.session_state[pk] = True
+                st.rerun()
 
 def render_invoices():
+    # ── Breadcrumb / header — always visible immediately ─────────────────────
+    inv_num = st.session_state.get("selected_invoice_detail")
+
+    if inv_num:
+        inv_num = str(inv_num).strip()
+
+        # Show header immediately so page is never blank
+        st.markdown(f"""
+<div style='display:flex;align-items:center;gap:10px;margin-bottom:16px;'>
+  <span style='font-size:22px;font-weight:900;color:#0f172a;'>Invoices</span>
+  <span style='color:#9ca3af;font-size:18px;'>›</span>
+  <span style='font-size:18px;font-weight:700;color:#2563eb;'>#{inv_num}</span>
+</div>
+""", unsafe_allow_html=True)
+
+        # Back button always visible immediately
+        if st.button("← Back to All Invoices", key="back_invoices_btn",
+                     use_container_width=False):
+            st.session_state["selected_invoice_detail"] = None
+            st.session_state["invoice_search_input"]    = ""
+            st.session_state["invoice_status_filter"]   = "All Status"
+            st.session_state["inv_selected_vendor"]     = "All Vendors"
+            # Clear paid keys
+            for _pk in [k for k in list(st.session_state.keys())
+                        if k.startswith("paid_")]:
+                del st.session_state[_pk]
+            st.rerun()
+
+        # ── Check cache first ─────────────────────────────────────────────────
+        _cache_key = f"_inv_detail_{inv_num}"
+        idf = st.session_state.get(_cache_key)
+
+        if idf is None:
+            # Show skeleton while loading
+            with st.container():
+                st.markdown(f"""
+<div style='background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;
+     padding:24px;margin:8px 0;'>
+  <div style='font-size:13px;color:#64748b;margin-bottom:12px;font-weight:600;'>
+    Loading invoice details for <strong>#{inv_num}</strong>...
+  </div>
+  <div style='background:#e2e8f0;height:16px;border-radius:6px;margin-bottom:10px;
+       width:60%;animation:pulse 1.5s infinite;'></div>
+  <div style='background:#e2e8f0;height:16px;border-radius:6px;margin-bottom:10px;
+       width:45%;animation:pulse 1.5s infinite;'></div>
+  <div style='background:#e2e8f0;height:16px;border-radius:6px;margin-bottom:10px;
+       width:75%;animation:pulse 1.5s infinite;'></div>
+</div>
+<style>
+@keyframes pulse {{
+  0%,100% {{ opacity:1; }} 50% {{ opacity:.4; }}
+}}
+</style>
+""", unsafe_allow_html=True)
+
+            # Fetch data
+            try:
+                isql = f"""SELECT f.invoice_number,f.posting_date AS invoice_date,
+                    f.invoice_amount_local AS invoice_amount,
+                    f.purchase_order_reference AS po_number,f.po_amount,f.due_date,
+                    UPPER(f.invoice_status) AS invoice_status,
+                    f.aging_days,f.vendor_id,v.vendor_name,v.vendor_name_2,v.country_code,
+                    v.city,v.postal_code,v.street,f.company_code,f.plant_code,f.currency
+                    FROM {DATABASE}.fact_all_sources_vw f
+                    LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
+                    WHERE CAST(f.invoice_number AS VARCHAR)='{inv_num}' LIMIT 1"""
+                idf = run_query(isql)
+                # Cache result so navigating back doesn't reload
+                st.session_state[_cache_key] = idf
+            except Exception as _e:
+                st.error(f"Error loading invoice {inv_num}: {_e}")
+                st.session_state["selected_invoice_detail"] = None
+                return
+
+            if idf is None or idf.empty:
+                st.warning(f"Invoice **{inv_num}** not found.")
+                st.session_state["selected_invoice_detail"] = None
+                st.session_state.pop(_cache_key, None)
+                return
+
+            # Rerun to render cleanly without skeleton
+            st.rerun()
+
+        # ── Render detail from cache (instant, no blank page) ─────────────────
+        if idf is not None and not idf.empty:
+            render_invoice_detail(idf.iloc[0].to_dict(), inv_num, show_pay_button=True)
+        else:
+            st.warning(f"Invoice **{inv_num}** not found.")
+            st.session_state["selected_invoice_detail"] = None
+            st.session_state.pop(_cache_key, None)
+        return
+
+    # ── Default: Invoice list view ────────────────────────────────────────────
     st.subheader("Invoices")
     st.markdown("Search, track and manage all invoices in one place")
-
-    qp=st.experimental_get_query_params()
-    if "invoice" in qp and qp["invoice"][0]:
-        st.session_state.selected_invoice_detail=qp["invoice"][0]
-        st.experimental_set_query_params(); st.rerun()
-
-    if st.session_state.get("selected_invoice_detail"):
-        inv_num=st.session_state.selected_invoice_detail
-        isql=f"""SELECT f.invoice_number,f.posting_date AS invoice_date,f.invoice_amount_local AS invoice_amount,
-            f.purchase_order_reference AS po_number,f.po_amount,f.due_date,UPPER(f.invoice_status) AS invoice_status,
-            f.aging_days,f.vendor_id,v.vendor_name,v.vendor_name_2,v.country_code,v.city,v.postal_code,v.street,
-            f.company_code,f.plant_code,f.currency
-            FROM {DATABASE}.fact_all_sources_vw f LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id=v.vendor_id
-            WHERE CAST(f.invoice_number AS VARCHAR)='{inv_num}' LIMIT 1"""
-        idf=run_query(isql)
-        if not idf.empty:
-            render_invoice_detail(idf.iloc[0].to_dict(),inv_num)
-            if st.button("← Back to Invoices List",key="back_invoices_btn",use_container_width=True):
-                st.session_state.selected_invoice_detail=None
-                st.session_state.invoice_search_input=""
-                st.session_state.invoice_status_filter="All Status"
-                st.session_state.inv_selected_vendor="All Vendors"
-                st.rerun()
-            return
-        else:
-            st.warning(f"Invoice {inv_num} not found.")
-            st.session_state.selected_invoice_detail=None; st.rerun()
-
-    for k,v in [("invoice_search_input",""),("invoice_status_filter","All Status"),("inv_selected_vendor","All Vendors")]:
-        if k not in st.session_state: st.session_state[k]=v
 
     cs1,cs2,cs3=st.columns([3,1,1])
     with cs1:
         us=st.text_input("Invoice Number",value=st.session_state.invoice_search_input,
                          placeholder="e.g., 9001767",label_visibility="collapsed",key="inv_search_widget")
-    with cs2: sc=st.button("🔍 Search",use_container_width=True,key="search_invoice_btn")
+    with cs2: sc=st.button("Search",use_container_width=True,key="search_invoice_btn")
     with cs3: rc=st.button("Reset",use_container_width=True,key="reset_invoice_btn")
 
     if rc:
@@ -2090,53 +3719,193 @@ def render_invoices():
 
 # ── Main app ──────────────────────────────────────────────────
 def main():
+    # ── MUST be first Streamlit call ─────────────────────────────────────────
+    st.set_page_config(
+        page_title="ProcureIQ",
+        layout="wide",
+        initial_sidebar_state="collapsed"
+    )
+
+    # ── Init session state — only set keys that do not exist yet ─────────────
+    _defaults = {
+        "page":                    "Dashboard",
+        "date_range":              compute_range_preset("Last 30 Days"),
+        "selected_vendor":         "All Vendors",
+        "preset":                  "Last 30 Days",
+        "na_tab":                  "Overdue",
+        "na_page":                 0,
+        # Genie
+        "genie_session_id":        None,
+        "current_messages":        [],
+        "genie_prefill":           "",
+        "show_summary":            False,
+        "conversation_summary":    "",
+        "show_chats_panel":        False,
+        "genie_input_version":     0,
+        "selected_analysis":       None,
+        "show_analysis":           False,
+        "analyst_response":        None,
+        "last_custom_query":       "",
+        # Invoice
+        "selected_invoice_detail": None,
+        "invoice_search_from_card": None,
+        "invoice_search_input":    "",
+        "invoice_status_filter":   "All Status",
+        "inv_selected_vendor":     "All Vendors",
+    }
+    for _k, _v in _defaults.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
     init_db()
-    st.set_page_config(page_title="ProcureIQ",layout="wide",initial_sidebar_state="collapsed")
-
-    if "bg_color" not in st.session_state: st.session_state["bg_color"]="#ffffff"
-
     inject_dashboard_css()
 
-    st.markdown("""<style>
-    .block-container{padding-top:0.5rem !important;padding-bottom:0rem !important;}
-    button{font-weight:500 !important;border-radius:8px !important;}
-    </style>""",unsafe_allow_html=True)
+    # ── BG colour picker — fixed bottom-right, visible on ALL tabs ───────────
+    # Initialise bg_color only if not already set (avoids widget/session conflict)
+    if "bg_color" not in st.session_state:
+        st.session_state["bg_color"] = "#ffffff"
+    _bg = st.session_state["bg_color"]
 
-    c1,c2,c3,c4,c5,c6=st.columns([1,1,1,1,1,1],gap="small")
-    with c1:
-        st.markdown("<div style='margin-top:4px;'><h1 style='font-weight:bold;margin-bottom:0;font-size:1.6rem;'>ProcureIQ</h1>"
-                    "<p style='font-size:0.7rem;color:gray;margin-top:-0.2rem;'>P2P Analytics</p></div>",unsafe_allow_html=True)
-    with c2:
-        if st.button("Dashboard",use_container_width=True,key="nav_dashboard",
-                     type="primary" if st.session_state.get("page")=="Dashboard" else "secondary"):
-            st.session_state.page="Dashboard"; st.rerun()
-    with c3:
-        if st.button("GenAI",use_container_width=True,key="nav_genai",
-                     type="primary" if st.session_state.get("page")=="Genie" else "secondary"):
-            st.session_state.page="Genie"; st.rerun()
-    with c4:
-        if st.button("Forecast",use_container_width=True,key="nav_forecast",
-                     type="primary" if st.session_state.get("page")=="Forecast" else "secondary"):
-            st.session_state.page="Forecast"; st.rerun()
-    with c5:
-        if st.button("Invoices",use_container_width=True,key="nav_invoices",
-                     type="primary" if st.session_state.get("page")=="Invoices" else "secondary"):
-            st.session_state.page="Invoices"; st.rerun()
-    with c6:
-        st.markdown(f"<div style='display:flex;justify-content:flex-end;'>"
-                    f"<img src='{LOGO_URL}' style='width:120px;height:auto;object-fit:contain;'/></div>",unsafe_allow_html=True)
+    st.markdown("""
+<style>
+.theme-anchor {
+    position: fixed; bottom: 22px; right: 28px;
+    z-index: 1000000; width: 50px; height: 50px;
+    border-radius: 9999px; background: white;
+    border: 2px solid #E5E7EB;
+    box-shadow: 0 4px 12px rgba(15,23,42,.14);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; color: #374151;
+    pointer-events: none;
+}
+div[data-testid="stColorPicker"] {
+    position: fixed !important; bottom: 22px !important;
+    right: 28px !important; width: 50px !important;
+    height: 50px !important; z-index: 1000001 !important;
+    opacity: 0 !important; cursor: pointer !important;
+}
+div[data-testid="stColorPicker"] * {
+    width: 100% !important; height: 100% !important;
+}
+div[data-testid="stColorPicker"] label { display: none !important; }
+</style>
+<div class="theme-anchor"><span>BG</span></div>
+""", unsafe_allow_html=True)
 
-    st.markdown("---")
+    # NOTE: Do NOT pass value= when key= is used — Streamlit manages the value
+    # via session_state["bg_color"] already set in _defaults above
+    _picked = st.color_picker("bg", key="bg_color", label_visibility="collapsed")
+    if _picked != _bg:
+        st.rerun()
 
-    if "page" not in st.session_state: st.session_state.page="Dashboard"
-    pg=st.session_state.page
-    if   pg=="Dashboard": render_dashboard()
-    elif pg=="Genie":     render_genie()
-    elif pg=="Forecast":  render_forecast()
-    else:                 render_invoices()
+    # ── Navigation bar ────────────────────────────────────────────────────────
+    pg = st.session_state.page
 
-    # ── BG Button: fixed bottom-right (self-contained HTML/JS) ──
-    render_bg_button_sidebar()
+    _h = st.columns([1.8, 0.85, 0.85, 0.85, 0.85, 1.4], gap="small")
 
-if __name__=="__main__":
-    main()
+    with _h[0]:
+        st.markdown("""
+<div style='display:flex;align-items:center;gap:10px;padding:6px 0;'>
+  <div>
+    <div style='font-size:22px;font-weight:900;letter-spacing:.2px;
+                line-height:1.1;color:#0f172a;'>ProcureIQ</div>
+    <div style='color:#64748b;font-size:11px;'>P2P Analytics</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    _nav_items = [
+        ("Dashboard", "Dashboard", "nav_dashboard"),
+        ("Genie",     "Genie",     "nav_genie"),
+        ("Forecast",  "Forecast",  "nav_forecast"),
+        ("Invoices",  "Invoices",  "nav_invoices"),
+    ]
+
+    for _idx, (_label, _page_key, _nav_key) in enumerate(_nav_items):
+        with _h[_idx + 1]:
+            _is_active = (pg == _page_key)
+            if st.button(_label, key=_nav_key, use_container_width=True,
+                         type="primary" if _is_active else "secondary"):
+                if not _is_active:
+                    _prev = pg
+
+                    # Reset Invoice state when leaving Invoice tab
+                    if _prev == "Invoices":
+                        st.session_state["selected_invoice_detail"] = None
+                        st.session_state["invoice_search_from_card"] = None
+                        st.session_state["invoice_search_input"]    = ""
+                        st.session_state["invoice_status_filter"]   = "All Status"
+                        st.session_state["inv_selected_vendor"]     = "All Vendors"
+                        # Clear all paid_* keys so Proceed to Pay never shows outside Invoice tab
+                        for _pk in [k for k in list(st.session_state.keys())
+                                    if k.startswith("paid_")]:
+                            del st.session_state[_pk]
+                        # Clear invoice detail cache
+                        for _ck in [k for k in list(st.session_state.keys())
+                                    if k.startswith("_inv_detail_")]:
+                            del st.session_state[_ck]
+
+                    # Reset Genie when leaving Genie tab
+                    if _prev == "Genie":
+                        st.session_state["current_messages"]     = []
+                        st.session_state["show_summary"]         = False
+                        st.session_state["conversation_summary"] = ""
+                        st.session_state["show_chats_panel"]     = False
+                        st.session_state["show_analysis"]        = False
+                        st.session_state["analyst_response"]     = None
+                        st.session_state["selected_analysis"]    = None
+                        st.session_state["last_custom_query"]    = ""
+                        st.session_state["genie_input_version"]  = (
+                            st.session_state.get("genie_input_version", 0) + 1
+                        )
+                        st.session_state.pop("auto_run_query", None)
+                        st.session_state.pop("genie_prefill", None)
+
+                    st.session_state["page"] = _page_key
+                    st.rerun()
+
+    with _h[5]:
+        st.markdown(
+            f"<div style='display:flex;align-items:center;justify-content:flex-end;"
+            f"height:52px;'><img src='{LOGO_URL}' "
+            f"style='height:46px;width:auto;object-fit:contain;'/></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        "<hr style='margin:4px 0 10px 0;border:none;"
+        "border-top:1px solid #e5e7eb;'/>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Route to page ─────────────────────────────────────────────────────────
+    if   pg == "Dashboard":
+        render_dashboard()
+    elif pg == "Genie":
+        render_genie()
+    elif pg == "Forecast":
+        render_forecast()
+    else:
+        render_invoices()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as _exc:
+        _msg = str(_exc)
+        _is_transient = any(kw in _msg for kw in (
+            "SessionInfo", "ScriptRunContext", "Bad message format",
+            "RerunException", "StopException",
+        ))
+        if _is_transient:
+            st.rerun()
+        else:
+            try:
+                st.error(
+                    "The dashboard encountered an error. "
+                    "Please refresh the page (F5 / Cmd+R)."
+                )
+                if st.button("🔄 Refresh", key="err_refresh_btn"):
+                    st.rerun()
+            except Exception:
+                pass
