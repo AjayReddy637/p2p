@@ -3592,7 +3592,9 @@ def render_invoice_detail(inv_row: dict, inv_num: str, show_pay_button: bool = F
 
     st.markdown("---")
     cs = gv("invoice_status", "").upper()
-    if show_pay_button:
+    # Strictly guard: only show Proceed to Pay on Invoices tab
+    _on_invoice_tab = st.session_state.get("page", "") == "Invoices"
+    if show_pay_button and _on_invoice_tab:
         if st.session_state.get(pk, False):
             st.success("✅ Invoice has been processed and marked as Paid.")
         elif cs in ("PAID", "CLEARED", "CLOSED", "SETTLED"):
@@ -3916,6 +3918,12 @@ div[data-testid="stColorPicker"] label { display: none !important; }
     )
 
     # ── Route to page ─────────────────────────────────────────────────────────
+    # ALWAYS clear Proceed to Pay state when not on Invoice tab
+    if pg != "Invoices":
+        for _k in list(st.session_state.keys()):
+            if _k.startswith("paid_") or _k == "proceed_pay_btn":
+                del st.session_state[_k]
+
     if   pg == "Dashboard":
         render_dashboard()
     elif pg == "Genie":
