@@ -2978,8 +2978,7 @@ div.genie-card-wrap button:hover {
                     for i, faq in enumerate(faqs[:5]):
                         if st.button(faq["query"][:55], key=f"faq_you_{i}",
                                      use_container_width=True):
-                            st.session_state.auto_run_query = faq["query"]
-                            st.rerun()
+                            process_user_question(faq["query"])
                 else:
                     for i, sug in enumerate([
                         "Total spend YTD and trends",
@@ -2987,8 +2986,7 @@ div.genie-card-wrap button:hover {
                         "Overdue invoices summary",
                     ]):
                         if st.button(sug, key=f"sug_you_{i}", use_container_width=True):
-                            st.session_state.auto_run_query = sug
-                            st.rerun()
+                            process_user_question(sug)
 
             with st.expander("Most Frequent (All)"):
                 af = get_frequent_questions_all_cached(5)
@@ -2996,8 +2994,7 @@ div.genie-card-wrap button:hover {
                     for i, faq in enumerate(af[:5]):
                         if st.button(faq["query"][:55], key=f"faq_all_{i}",
                                      use_container_width=True):
-                            st.session_state.auto_run_query = faq["query"]
-                            st.rerun()
+                            process_user_question(faq["query"])
                 else:
                     st.caption("No questions yet")
 
