@@ -257,7 +257,12 @@ def run_query(sql: str) -> pd.DataFrame:
                 df[col] = df[col].astype(float)
         return df
     except Exception as e:
-        st.error(f"Athena query failed: {e}\nSQL: {sql[:500]}")
+        # Don't surface raw Athena/SQL errors to the user — every caller
+        # already handles an empty DataFrame gracefully (fallback data,
+        # friendly messages, etc). This avoids the brief "Athena query
+        # failed..." flash that used to appear for a second before the
+        # real (correct) answer rendered on rerun. Log quietly instead.
+        print(f"[run_query] Athena query failed: {e}\nSQL: {sql[:500]}")
         return pd.DataFrame()
 
 # ── Bedrock client ───────────────────────────────────────────
@@ -641,17 +646,23 @@ def get_saved_insights_cached(page="genie", limit=20):
 @st.cache_data(ttl=600)
 def get_frequent_questions_by_user_cached(limit=10):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute('SELECT normalized_query,COUNT(*) as cnt FROM question_history WHERE user_name=? GROUP BY normalized_query ORDER BY cnt DESC LIMIT ?',
+    c.execute('''SELECT normalized_query, COUNT(*) AS cnt, MAX(asked_at) AS last_asked
+                 FROM question_history WHERE user_name=?
+                 GROUP BY normalized_query
+                 ORDER BY last_asked DESC LIMIT ?''',
               (get_current_user(), limit))
     rows = c.fetchall(); conn.close()
-    return [{"query":r[0],"count":r[1]} for r in rows]
+    return [{"query":r[0],"count":r[1],"last_asked":r[2]} for r in rows]
 
 @st.cache_data(ttl=600)
 def get_frequent_questions_all_cached(limit=10):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute('SELECT normalized_query,COUNT(*) as cnt FROM question_history GROUP BY normalized_query ORDER BY cnt DESC LIMIT ?', (limit,))
+    c.execute('''SELECT normalized_query, COUNT(*) AS cnt, MAX(asked_at) AS last_asked
+                 FROM question_history
+                 GROUP BY normalized_query
+                 ORDER BY last_asked DESC LIMIT ?''', (limit,))
     rows = c.fetchall(); conn.close()
-    return [{"query":r[0],"count":r[1]} for r in rows]
+    return [{"query":r[0],"count":r[1],"last_asked":r[2]} for r in rows]
 
 def get_recent_conversation_context(limit: int = 20, max_age_days: int = 2) -> str:
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
@@ -1867,7 +1878,11 @@ CRITICAL RULES:
 - payment_processing_cycle_time_vw: NO posting_date. Use year/month. Column = avg_payment_cycle_time_days.
 - full_payment_rate_vw: NO posting_date. Use year/month. Column = full_payment_rate_pct (NOT full_payment_rate).
 - fact_all_sources_vw: HAS posting_date for date range filters.
-- Always COALESCE numeric columns. Use Presto functions. LIMIT 1000 unless aggregating.
+- Always COALESCE numeric columns. Use Presto functions ONLY (this is Amazon Athena / Presto SQL, NOT MySQL,
+  NOT generic ANSI SQL). Use date_trunc(), date_add(), date_diff(), EXTRACT(field FROM date) for date math.
+  NEVER use date_part(), DATEPART(), DATEADD(), GETDATE(), or any SQL Server / MySQL-style function — these
+  do not exist in Athena/Presto and will throw FUNCTION_NOT_FOUND.
+- LIMIT 1000 unless aggregating.
 - Output only SQL, no markdown/explanation.
 
 Semantic model:
@@ -1934,24 +1949,171 @@ def generate_sql(question: str) -> str:
 
 SYS_ANALYST = "You are a helpful senior procurement analyst. Respond in markdown with Descriptive (What the data shows) and Prescriptive (Recommendations) sections."
 
+def _reinterpret_question(question: str) -> str:
+    """Ask Bedrock to restate the question more precisely, the way the
+    reference screenshot shows under 'Your question'."""
+    txt = ask_bedrock(
+        f'Rewrite this user question as a single precise analytical question, '
+        f'expanding any vague time references (e.g. "this month") into an explicit '
+        f'comparison framing. Return ONLY the rewritten question, no preamble.\n\n'
+        f'Question: "{question}"',
+        "You rewrite vague analytics questions into precise, explicit one-sentence questions."
+    )
+    txt = (txt or "").strip().strip('"')
+    return txt if txt else question
+
+def _fetch_month_over_month_drivers(vendor_or_category: str = "vendor") -> pd.DataFrame:
+    """Builds the THIS_MONTH_SPEND vs LAST_MONTH_SPEND driver table used as
+    'supporting data' for custom Genie questions, matching the reference format:
+    ROW_TYPE | DRIVER | THIS_MONTH_SPEND | LAST_MONTH_SPEND | SPEND_CHANGE
+
+    Uses the latest month that actually has posting_date data in the warehouse
+    (rather than hard-coding CURRENT_DATE), so this still works correctly on
+    historical / demo datasets where "today" doesn't fall inside the loaded
+    data range.
+    """
+    latest_sql = f"""
+        SELECT MAX(DATE_TRUNC('month', posting_date)) AS latest_month
+        FROM {DATABASE}.fact_all_sources_vw
+        WHERE posting_date IS NOT NULL
+    """
+    latest_df = run_query(latest_sql)
+    anchor_month_expr = "DATE_TRUNC('month', CURRENT_DATE)"
+    if not latest_df.empty and pd.notna(latest_df.iloc[0].get("latest_month")):
+        try:
+            latest_month = pd.to_datetime(latest_df.iloc[0]["latest_month"]).date()
+            anchor_month_expr = f"DATE '{latest_month.isoformat()}'"
+        except Exception:
+            pass
+
+    sql = f"""
+        WITH this_month AS (
+            SELECT COALESCE(v.vendor_name,'Unknown') AS driver,
+                   SUM(COALESCE(f.invoice_amount_local,0)) AS spend
+            FROM {DATABASE}.fact_all_sources_vw f
+            LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id = v.vendor_id
+            WHERE DATE_TRUNC('month', f.posting_date) = {anchor_month_expr}
+              AND UPPER(f.invoice_status) NOT IN ('CANCELLED','REJECTED')
+            GROUP BY 1
+        ),
+        last_month AS (
+            SELECT COALESCE(v.vendor_name,'Unknown') AS driver,
+                   SUM(COALESCE(f.invoice_amount_local,0)) AS spend
+            FROM {DATABASE}.fact_all_sources_vw f
+            LEFT JOIN {DATABASE}.dim_vendor_vw v ON f.vendor_id = v.vendor_id
+            WHERE DATE_TRUNC('month', f.posting_date) = DATE_ADD('month', -1, {anchor_month_expr})
+              AND UPPER(f.invoice_status) NOT IN ('CANCELLED','REJECTED')
+            GROUP BY 1
+        )
+        SELECT
+            'VENDOR' AS row_type,
+            COALESCE(tm.driver, lm.driver) AS driver,
+            COALESCE(tm.spend, 0) AS this_month_spend,
+            COALESCE(lm.spend, 0) AS last_month_spend,
+            COALESCE(tm.spend, 0) - COALESCE(lm.spend, 0) AS spend_change
+        FROM this_month tm
+        FULL OUTER JOIN last_month lm ON tm.driver = lm.driver
+        ORDER BY ABS(COALESCE(tm.spend, 0) - COALESCE(lm.spend, 0)) DESC
+        LIMIT 15
+    """
+    df = run_query(sql)
+    if df.empty:
+        return df
+    df.columns = [c.lower() for c in df.columns]
+    for c in ["this_month_spend", "last_month_spend", "spend_change"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    return df
+
+def _derive_chart_title(question: str) -> str:
+    """Builds the dynamic chart title shown above the bar chart, matching the
+    reference format: 'This Month vs Previous Month — Where Spend Increased/Changed'."""
+    ql = question.lower()
+    if any(w in ql for w in ["higher", "increase", "more", "up", "rose", "rising", "grew"]):
+        suffix = "Where Spend Increased"
+    elif any(w in ql for w in ["lower", "decrease", "less", "down", "fell", "dropped", "declin"]):
+        suffix = "Where Spend Decreased"
+    else:
+        suffix = "Where Spend Changed"
+    return f"This Month vs Previous Month — {suffix}"
+
 def process_custom_query(query: str, history: str="") -> dict:
     if not is_relevant_question(query):
         return {"layout":"static","analyst_response":OUT_OF_DOMAIN_MSG,"question":query}
-    sql = generate_sql(query)
-    if not sql or not is_safe_sql(sql):
+
+    try:
+        # ── Reinterpreted question (shown in the blue "Descriptive" box) ──────
+        reinterpreted = _reinterpret_question(query)
+        chart_title = _derive_chart_title(query)
+
+        # ── Try to answer with a free-form SQL query first ────────────────────
+        sql = generate_sql(query)
+        custom_df = pd.DataFrame()
+        if sql and is_safe_sql(sql):
+            sql = ensure_limit(sql)
+            custom_df = run_query(sql)
+
+        # ── Always build the month-over-month driver comparison as supporting data ─
+        driver_df = _fetch_month_over_month_drivers()
+
+        # Pick whichever dataset actually has rows to drive the chart/table;
+        # prefer the targeted SQL result if it returned something usable.
+        if not custom_df.empty:
+            preview_df = custom_df
+        elif not driver_df.empty:
+            preview_df = driver_df
+        else:
+            preview_df = pd.DataFrame()
+
+        if preview_df.empty:
+            # Still respond — never show a bare "no data" error for custom questions
+            txt = ask_bedrock(
+                f'{history}\nUser asked: "{query}"\nNo matching data was found in the warehouse for this '
+                f'specific question. Provide a brief, honest Descriptive note that data was insufficient, '
+                f'and a Prescriptive suggestion for how to rephrase or what data to check next.',
+                SYS_ANALYST)
+            return {
+                "layout": "analyst",
+                "sql": sql or "",
+                "df": [],
+                "driver_df": [],
+                "question": query,
+                "reinterpreted_question": reinterpreted,
+                "chart_title": chart_title,
+                "analyst_response": txt or "Descriptive — No matching records were found for this question.\n\nPrescriptive — Try specifying a vendor name, date range, or invoice status.",
+            }
+
+        preview = preview_df.head(10).to_string(index=False, max_colwidth=40)
         txt = ask_bedrock(
-            f'{history}\nUser asked: "{query}"\nNo SQL was generated. Provide a general procurement answer.',
-            SYS_ANALYST)
-        if txt:
-            return {"layout":"static","analyst_response":txt,"question":query}
-        return {"layout":"error","message":"Could not generate SQL for this question. Please try rephrasing with more specific procurement terms."}
-    sql = ensure_limit(sql)
-    df = run_query(sql)
-    if df.empty:
-        return {"layout":"error","message":"Query returned no data. Try rephrasing with more specific terms like vendor name, date range, or invoice status."}
-    preview = df.head(10).to_string(index=False,max_colwidth=40)
-    txt = ask_bedrock(f'{history}\nUser asked: "{query}"\nData:\n{preview}\nSQL:\n{sql}', SYS_ANALYST)
-    return {"layout":"analyst","sql":sql,"df":df.to_dict(orient="records"),"question":query,"analyst_response":txt or preview}
+            f'{history}\nUser asked: "{query}"\nReinterpreted as: "{reinterpreted}"\n'
+            f'Data:\n{preview}\nSQL:\n{sql or "(none — used month-over-month driver comparison)"}',
+            SYS_ANALYST
+        )
+        return {
+            "layout": "analyst",
+            "sql": sql or "",
+            "df": preview_df.to_dict(orient="records"),
+            "driver_df": driver_df.to_dict(orient="records") if not driver_df.empty else [],
+            "question": query,
+            "reinterpreted_question": reinterpreted,
+            "chart_title": chart_title,
+            "analyst_response": txt or preview,
+        }
+    except Exception as _e:
+        return {
+            "layout": "analyst",
+            "sql": "",
+            "df": [],
+            "driver_df": [],
+            "question": query,
+            "reinterpreted_question": query,
+            "chart_title": "This Month vs Previous Month — Where Spend Changed",
+            "analyst_response": (
+                "Descriptive — We hit an issue retrieving data for this question.\n\n"
+                "Prescriptive — Please try rephrasing with a specific vendor name, date range, "
+                "or invoice status, or try again in a moment."
+            ),
+        }
 
 def process_cash_flow_forecast(question: str, history: str="") -> dict:
     if not is_relevant_question(question): return {"layout":"static","analyst_response":OUT_OF_DOMAIN_MSG}
@@ -2172,6 +2334,120 @@ def _quick_invoice_aging():
 
 # ── Genie render helpers ──────────────────────────────────────
 
+def _render_question_box(question: str, reinterpreted: str = ""):
+    """Renders the 'Your question' header + blue Descriptive interpretation box
+    shown at the top of every custom Genie response, matching the reference image."""
+    question = str(question) if question else ""
+    reinterpreted = str(reinterpreted) if reinterpreted else ""
+    st.markdown(
+        f"<div style='font-size:13px;color:#64748b;margin-bottom:2px;'>Your question</div>"
+        f"<div style='font-size:16px;font-weight:700;color:#0f172a;margin-bottom:10px;'>{html.escape(question)}</div>",
+        unsafe_allow_html=True,
+    )
+    if reinterpreted:
+        st.markdown(
+            f"<div style='background:#eaf3fb;border-left:4px solid #2563eb;border-radius:8px;"
+            f"padding:14px 16px;margin-bottom:10px;'>"
+            f"<div style='font-weight:700;color:#1d4ed8;font-size:13.5px;margin-bottom:6px;'>"
+            f"Descriptive — What the data shows</div>"
+            f"<div style='font-size:13px;color:#1e293b;margin-bottom:6px;'>This is our interpretation of your question:</div>"
+            f"<div style='font-size:13.5px;color:#0f172a;line-height:1.55;'>{html.escape(reinterpreted)}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+def _render_supporting_data(df_main: pd.DataFrame, driver_df: pd.DataFrame = None,
+                            sql=None, chart_title: str = "This Month vs Previous Month — Where Spend Changed"):
+    """Renders two SIBLING (not nested) collapsible expanders:
+    1. 'View supporting data (charts & table)' — chart + table + Download Results
+    2. 'View SQL used' — the SQL query, on its own, directly below #1
+    Both are ALWAYS rendered for every answer, with graceful fallback content
+    when no chart/table/SQL data is available, matching the required fixed
+    response format: Descriptive → Prescriptive → View supporting data → View SQL used.
+    """
+    _required_driver_cols = {"driver", "this_month_spend", "last_month_spend"}
+    has_driver = (
+        driver_df is not None
+        and isinstance(driver_df, pd.DataFrame)
+        and not driver_df.empty
+        and _required_driver_cols.issubset(set(driver_df.columns))
+    )
+    has_main = df_main is not None and isinstance(df_main, pd.DataFrame) and not df_main.empty
+
+    # ── 1. View supporting data (charts & table) + Download Results ───────────
+    with st.expander("View supporting data (charts & table)", expanded=False):
+        _csv_bytes = None
+        try:
+            if has_driver:
+                st.markdown(f"**{chart_title}**")
+                chart_df = driver_df.copy()
+                chart_df["driver"] = chart_df["driver"].astype(str)
+                for c in ["this_month_spend", "last_month_spend"]:
+                    chart_df[c] = pd.to_numeric(chart_df[c], errors="coerce").fillna(0.0)
+
+                melted = chart_df.melt(
+                    id_vars=["driver"], value_vars=["this_month_spend", "last_month_spend"],
+                    var_name="period", value_name="spend"
+                )
+                melted["period"] = melted["period"].map(
+                    {"this_month_spend": "This Month", "last_month_spend": "Previous Month"}
+                )
+                st.altair_chart(
+                    alt.Chart(melted).mark_bar().encode(
+                        x=alt.X("driver:N", sort=alt.EncodingSortField(field="spend", order="descending"),
+                                 axis=alt.Axis(title=None, labelAngle=-35)),
+                        y=alt.Y("spend:Q", axis=alt.Axis(title=None, format="~s")),
+                        color=alt.Color("period:N",
+                            scale=alt.Scale(domain=["This Month", "Previous Month"], range=["#16a34a", "#2563eb"]),
+                            legend=alt.Legend(orient="top-right", title=None)),
+                        xOffset="period:N",
+                        tooltip=["driver:N", "period:N", alt.Tooltip("spend:Q", format="$,.0f")]
+                    ).properties(height=300),
+                    use_container_width=True,
+                )
+                display_driver = chart_df.rename(columns={
+                    "row_type": "ROW_TYPE", "driver": "DRIVER",
+                    "this_month_spend": "THIS_MONTH_SPEND",
+                    "last_month_spend": "LAST_MONTH_SPEND",
+                    "spend_change": "SPEND_CHANGE",
+                })
+                st.dataframe(safe_dataframe_display(display_driver), use_container_width=True, hide_index=True)
+                _csv_bytes = display_driver.to_csv(index=False).encode()
+            elif has_main:
+                st.dataframe(safe_dataframe_display(df_main), use_container_width=True, hide_index=True)
+                ch = auto_chart(df_main)
+                if ch:
+                    st.altair_chart(ch, use_container_width=True)
+                _csv_bytes = df_main.to_csv(index=False).encode()
+            else:
+                st.caption("No chart or table data is available for this question.")
+        except Exception:
+            st.info("Supporting chart/table unavailable for this question.")
+
+        # Download Results — always present, inside the supporting-data expander
+        if _csv_bytes is None:
+            _csv_bytes = "No data available".encode()
+        st.download_button(
+            "Download Results",
+            data=_csv_bytes,
+            file_name="genie_supporting_data.csv",
+            mime="text/csv",
+            key=f"dl_{hashlib.md5(_csv_bytes).hexdigest()[:10]}",
+        )
+
+    # ── 2. View SQL used — sibling expander, directly below #1 ────────────────
+    with st.expander("View SQL used", expanded=False):
+        sql_str = _safe_sql_string(sql) if sql else ""
+        if isinstance(sql, dict) and sql:
+            for n, q in sql.items():
+                if q:
+                    st.markdown(f"**{n}**")
+                    st.code(str(q), language="sql")
+        elif sql_str and sql_str.strip():
+            st.code(sql_str, language="sql")
+        else:
+            st.caption("No SQL was used to answer this question.")
+
 def _render_response_expanders(analyst_text: str, sql=None, predictive_text: str = ""):
     """Render analyst response as collapsible expanders matching the image format:
     › Descriptive — What the data shows   (collapsed)
@@ -2346,7 +2622,28 @@ def _dispatch_query(q: str, history: str) -> dict:
     return process_custom_query(q, history)
 
 def process_user_question(user_question: str):
+    """Handles every question typed into the Ask-a-question box, and every
+    click on 'Frequently Asked by You' / 'Most Frequent (All)' suggestions.
+    Always renders in the unified format: Your question → Descriptive box →
+    Prescriptive expander → View supporting data (chart + table + download + SQL).
+    Pre-built library analyses (Forecast tab playbooks, GR/IR buttons, quick
+    cards) go through auto_run_query / _dispatch_query instead and keep their
+    specialized layouts.
+
+    Every question that reaches this function — relevant or not, cached or
+    freshly computed — is recorded via save_question() so 'Frequently Asked
+    by You' / 'Most Frequent (All)' always reflect what was typed in chat,
+    not just what was clicked on a tile.
+    """
     with st.spinner("Generating insights..."):
+        # ── Always record the question first, regardless of outcome ───────────
+        try:
+            save_question(user_question, "chat")
+            get_frequent_questions_by_user_cached.clear()
+            get_frequent_questions_all_cached.clear()
+        except Exception:
+            pass
+
         if not is_relevant_question(user_question):
             result = {"layout": "static", "analyst_response": OUT_OF_DOMAIN_MSG, "question": user_question}
             st.session_state.current_messages = [
@@ -2358,7 +2655,10 @@ def process_user_question(user_question: str):
             return
 
         cached = get_cache_with_ttl(user_question, cache_type="genie")
-        if cached:
+        if cached and cached.get("layout") == "analyst":
+            # Only reuse cache if it's already in the unified format —
+            # stale cache entries from older specialized layouts are skipped
+            # so they don't render with the wrong shape.
             st.session_state.current_messages=[
                 {"role":"user","content":user_question,"timestamp":datetime.now()},
                 {"role":"assistant","content":cached.get('analyst_response',''),
@@ -2367,12 +2667,14 @@ def process_user_question(user_question: str):
             save_chat_message(st.session_state.genie_session_id,1,"assistant",
                               cached.get('analyst_response',''),source="cache",
                               sql_used=_safe_sql_string(cached.get("sql")))
-            save_question(user_question,"custom")
         else:
             history = build_bedrock_context(
                 st.session_state.genie_session_id, max_turns=6
             )
-            result = _dispatch_query(user_question, history)
+            # Always route free-typed / suggested questions through the
+            # unified custom-query handler — never the specialized
+            # cash-flow / early-payment / GR/IR layouts.
+            result = process_custom_query(user_question, history)
             st.session_state.current_messages=[{"role":"user","content":user_question,"timestamp":datetime.now()}]
             if result.get("layout")!="error":
                 ac=result.get('analyst_response','Analysis complete.')
@@ -2381,7 +2683,6 @@ def process_user_question(user_question: str):
                 save_chat_message(st.session_state.genie_session_id,0,"user",user_question)
                 save_chat_message(st.session_state.genie_session_id,1,"assistant",ac,
                                   sql_used=_safe_sql_string(result.get("sql")))
-                save_question(user_question,"forecast")
                 infer_and_save_preferences(user_question, result)
             else:
                 st.session_state.current_messages.append({"role":"assistant","content":result.get("message","Error"),"timestamp":datetime.now()})
@@ -2568,6 +2869,8 @@ input:focus { outline: none !important; }
                 save_chat_message(st.session_state.genie_session_id, 1, "assistant", ac,
                                   sql_used=_safe_sql_string(result.get("sql")))
                 save_question(auto_query, "forecast")
+                get_frequent_questions_by_user_cached.clear()
+                get_frequent_questions_all_cached.clear()
                 set_cache(auto_query, result)
             else:
                 st.session_state.current_messages.append(
@@ -3218,10 +3521,11 @@ div.genie-card-wrap button:hover {
             # ── Chat messages ─────────────────────────────────────────────────
             elif st.session_state.current_messages:
                 for msg in st.session_state.current_messages:
+                  try:
                     if msg["role"] == "user":
                         st.markdown(
                             f'<div class="message-user"><strong>You</strong><br/>'
-                            f'{html.escape(msg["content"])}</div>',
+                            f'{html.escape(str(msg.get("content","")))}</div>',
                             unsafe_allow_html=True,
                         )
                     else:
@@ -3233,7 +3537,7 @@ div.genie-card-wrap button:hover {
                             resp = msg["response"]
                             layout = resp.get("layout")
                             if layout == "static":
-                                st.info(resp["analyst_response"])
+                                st.info(resp.get("analyst_response",""))
                             elif layout == "cash_flow":
                                 render_cash_flow_response(resp)
                             elif layout == "early_payment":
@@ -3253,30 +3557,38 @@ div.genie-card-wrap button:hover {
                             elif layout == "quick":
                                 render_quick_analysis_response(resp)
                             elif layout == "analyst":
-                                # ── Supporting data first ─────────────────────
+                                # ── Question + blue Descriptive interpretation box ──
+                                _render_question_box(
+                                    resp.get("question", ""),
+                                    resp.get("reinterpreted_question", "")
+                                )
+
+                                # ── Prescriptive expander — always present ───────
+                                import re as _re_an
+                                _analyst_text = resp.get("analyst_response", "") or ""
+                                _pres_parts = _re_an.split(
+                                    r'(?i)\n?\*{0,2}prescriptive\*{0,2}[:\s\-—]*',
+                                    _analyst_text, maxsplit=1
+                                )
+                                _pres_text = _pres_parts[1].strip() if len(_pres_parts) > 1 else _analyst_text.strip()
+                                with st.expander("Prescriptive — Recommendations & next steps", expanded=False):
+                                    st.markdown(_pres_text if _pres_text else "No specific recommendations were generated for this question. Try rephrasing with more detail for a tailored suggestion.")
+
+                                # ── Supporting data: chart + table + download + SQL ──
                                 try:
                                     raw_df = resp.get("df", [])
-                                    if isinstance(raw_df, list) and len(raw_df) > 0:
-                                        df_r = pd.DataFrame(raw_df)
-                                    elif isinstance(raw_df, dict):
-                                        df_r = pd.DataFrame([raw_df])
-                                    else:
-                                        df_r = pd.DataFrame()
+                                    df_r = pd.DataFrame(raw_df) if isinstance(raw_df, list) and raw_df else pd.DataFrame()
                                 except Exception:
                                     df_r = pd.DataFrame()
-                                if not df_r.empty:
-                                    st.dataframe(
-                                        safe_dataframe_display(df_r),
-                                        use_container_width=True,
-                                        hide_index=True,
-                                    )
-                                    ch_r = auto_chart(df_r)
-                                    if ch_r:
-                                        st.altair_chart(ch_r, use_container_width=True)
-                                # ── Expander toggles ─────────────────────────
-                                _render_response_expanders(
-                                    resp.get("analyst_response", ""),
-                                    sql=resp.get("sql", "")
+                                try:
+                                    raw_driver = resp.get("driver_df", [])
+                                    driver_r = pd.DataFrame(raw_driver) if isinstance(raw_driver, list) and raw_driver else pd.DataFrame()
+                                except Exception:
+                                    driver_r = pd.DataFrame()
+
+                                _render_supporting_data(
+                                    df_r, driver_r, sql=resp.get("sql", ""),
+                                    chart_title=resp.get("chart_title", "This Month vs Previous Month — Where Spend Changed")
                                 )
                             elif layout == "error":
                                 st.error(resp.get("message", "Unknown error"))
@@ -3291,6 +3603,8 @@ div.genie-card-wrap button:hover {
                                 )
                             else:
                                 st.markdown(msg["content"])
+                  except Exception as _msg_err:
+                    st.warning("This response couldn't be displayed. Try asking the question again.")
 
 
     # ── Ask a question — same width as AI Assistant container ────────────────
@@ -3546,6 +3860,23 @@ def render_invoice_detail(inv_row: dict, inv_num: str):
     else:
         hdf.columns=[c.lower() for c in hdf.columns]
         hdf=hdf[["status","effective_date","status_notes"]].copy()
+
+    # ── If this invoice was just marked Paid via "Proceed to Pay", append a PAID row ──
+    if st.session_state.get(f"paid_row_{inv_num}", False):
+        paid_row = pd.DataFrame([{
+            "status": "PAID",
+            "effective_date": date.today().isoformat(),
+            "status_notes": "Processed via ProcureSpendIQ app",
+        }])
+        # Avoid duplicating if a PAID row with this note already exists
+        already_paid = (
+            not hdf.empty
+            and ((hdf["status"].astype(str).str.upper() == "PAID")
+                 & (hdf["status_notes"].astype(str) == "Processed via ProcureSpendIQ app")).any()
+        )
+        if not already_paid:
+            hdf = pd.concat([hdf, paid_row], ignore_index=True)
+
     # Pay button deliberately removed from here — rendered only in render_invoices()
     render_simple_table(
         hdf[["status", "effective_date", "status_notes"]],
@@ -3698,6 +4029,9 @@ def render_invoices():
                         )
                     if submitted:
                         st.session_state[_pk] = True
+                        st.session_state[f"paid_row_{inv_num}"] = True
+                        # Invalidate cached status-history so the new PAID row shows immediately
+                        st.session_state.pop(f"inv_hist_{inv_num}", None)
                         st.rerun()
         else:
             st.warning(f"Invoice **{inv_num}** not found.")
